@@ -9,7 +9,7 @@ Chat Completions API，供 Claude Code / OpenCode / Cline / Cherry Studio
 分包结构（协议层 / 通道层 / 翻译层分离）：
   routes/chat.py           /v1/chat/completions
   routes/responses.py      /v1/responses（经 adapters/responses.py 翻译）
-  routes/messages.py       /v1/messages（经 adapters/anthropic.py 翻译）
+  routes/anthropic.py      /v1/messages（经 adapters/anthropic.py 翻译）
   adapters/responses.py    Responses ⇄ Chat 翻译桥（去 _bridge 后缀）
   adapters/anthropic.py    Anthropic Messages ⇄ Chat 翻译桥
   lanes/benefit.py         免费额度通道（签到/余额/免费模型同步）
@@ -47,8 +47,8 @@ from requests.adapters import HTTPAdapter
 
 from adapters import anthropic, responses as responses_adapter
 from lanes import benefit, credential_provider, oauth  # noqa: F401  (oauth 仅登录时用)
+from routes import anthropic as anthropic_route
 from routes import chat as chat_route
-from routes import messages as messages_route
 from routes import responses as responses_route
 
 load_dotenv()
@@ -1222,7 +1222,7 @@ import sys as _sys
 _core = _sys.modules[__name__]
 chat_route.register(app, _core)
 responses_route.register(app, _core)
-messages_route.register(app, _core)
+anthropic_route.register(app, _core)
 
 
 if __name__ == "__main__":

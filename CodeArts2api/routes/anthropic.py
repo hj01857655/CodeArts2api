@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""routes/messages.py — Anthropic Messages 路由（/v1/messages）。
+"""routes/anthropic.py — Anthropic Messages 路由（/v1/messages）。
 
 Claude Code 等原生 Anthropic 客户端：adapters/anthropic.py 双向翻译，引擎件
 （签名/发送/重试/SSE 解析）全在 server.py。
