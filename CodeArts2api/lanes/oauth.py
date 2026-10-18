@@ -6,24 +6,33 @@ CodeArts OAuth2 PKCE 登录 → 保存 auths/codearts-{user_id}.json。
 与 Go 版 cmd/login 对齐。凭证落盘后由 credential_provider.py 自动加载和续期。
 
 用法：
-    python oauth.py              # 本机有浏览器，自动打开
-    python oauth.py --print-only # 服务器模式，只打印链接，手动粘贴回调 URL
+    python lanes/oauth.py              # 本机有浏览器，自动打开
+    python lanes/oauth.py --print-only # 服务器模式，只打印链接，手动粘贴回调 URL
 """
-import base64
-import hashlib
-import http.server
-import json
-import os
-import secrets
-import sys
-import threading
-import time
-import urllib.parse
-import webbrowser
+# 作为独立入口（python lanes/oauth.py）运行时仓库根不在 sys.path 上，
+# 兜底把仓库根加进来，否则 `from lanes import credential_provider` 失败。
+import os as _os
+import sys as _sys
 
-import requests
+_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+if _ROOT not in _sys.path:
+    _sys.path.insert(0, _ROOT)
 
-import credential_provider
+import base64  # noqa: E402
+import hashlib  # noqa: E402
+import http.server  # noqa: E402
+import json  # noqa: E402
+import os  # noqa: E402
+import secrets  # noqa: E402
+import sys  # noqa: E402
+import threading  # noqa: E402
+import time  # noqa: E402
+import urllib.parse  # noqa: E402
+import webbrowser  # noqa: E402
+
+import requests  # noqa: E402
+
+from lanes import credential_provider  # noqa: E402
 
 CLIENT_ID = "codearts-agent"
 PORTAL_HOST = "https://codearts.huaweicloud.com/portal"

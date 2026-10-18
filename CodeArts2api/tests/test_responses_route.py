@@ -8,8 +8,14 @@ monkeypatch 掉 _upstream.post / _hmac_headers / 模型同步 / API_KEY，覆盖
   4. /v1/chat/completions 流式回归：_send_upstream 重构不破坏老路由
 """
 import json
+import os
+import sys
 
-import server
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+sys.path.insert(0, ROOT)
+
+import server  # noqa: E402
 
 
 class FakeUpstream:

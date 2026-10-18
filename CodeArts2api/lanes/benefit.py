@@ -11,27 +11,36 @@ CodeArts 免费额度签到/查询工具
 
 用法（凭证由 CodeArts IDE 会话自动读取，无需配置）：
 
-    python benefit.py            # 全部：tokens 签到 + 积分签到 + 各项余额
-    python benefit.py status     # 只查询 tokens 签到状态，不领取
-    python benefit.py claim      # 只领每日 1000 万福利 Token
-    python benefit.py credit     # 只领每日 1000 积分 + 查积分余额
-    python benefit.py models     # 查询免费模型列表
+    python lanes/benefit.py            # 全部：tokens 签到 + 积分签到 + 各项余额
+    python lanes/benefit.py status     # 只查询 tokens 签到状态，不领取
+    python lanes/benefit.py claim      # 只领每日 1000 万福利 Token
+    python lanes/benefit.py credit     # 只领每日 1000 积分 + 查积分余额
+    python lanes/benefit.py models     # 查询免费模型列表
 
 配合 Windows 计划任务可实现每日自动签到，例如每天 09:05 执行：
-    schtasks /create /tn CodeArtsBenefit /tr "python C:\\...\\benefit.py claim" /sc daily /st 09:05
+    schtasks /create /tn CodeArtsBenefit /tr "python C:\\...\\lanes\\benefit.py claim" /sc daily /st 09:05
 """
-import datetime
-import hashlib
-import hmac
-import json
-import os
-import sys
-import urllib.parse
+# 作为独立入口（python lanes/benefit.py）运行时仓库根不在 sys.path 上，
+# 兜底把仓库根加进来，否则 `from lanes import credential_provider` 失败。
+import os as _os
+import sys as _sys
 
-import requests
-from dotenv import load_dotenv
+_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+if _ROOT not in _sys.path:
+    _sys.path.insert(0, _ROOT)
 
-import credential_provider
+import datetime  # noqa: E402
+import hashlib  # noqa: E402
+import hmac  # noqa: E402
+import json  # noqa: E402
+import os  # noqa: E402
+import sys  # noqa: E402
+import urllib.parse  # noqa: E402
+
+import requests  # noqa: E402
+from dotenv import load_dotenv  # noqa: E402
+
+from lanes import credential_provider  # noqa: E402
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 

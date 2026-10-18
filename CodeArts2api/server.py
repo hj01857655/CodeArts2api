@@ -6,6 +6,22 @@ CodeArts OpenAI 兼容代理
 Chat Completions API，供 Claude Code / OpenCode / Cline / Cherry Studio
 等任何支持自定义 OpenAI Base URL 的工具直接使用。
 
+分包结构（协议层 / 通道层 / 翻译层分离）：
+  routes/chat.py           /v1/chat/completions
+  routes/responses.py      /v1/responses（经 adapters/responses.py 翻译）
+  routes/messages.py       /v1/messages（经 adapters/anthropic.py 翻译）
+  adapters/responses.py    Responses ⇄ Chat 翻译桥（去 _bridge 后缀）
+  adapters/anthropic.py    Anthropic Messages ⇄ Chat 翻译桥
+  lanes/benefit.py         免费额度通道（签到/余额/免费模型同步）
+  lanes/credential_provider.py  凭证装载与自动续期
+  lanes/oauth.py           OAuth2 PKCE 浏览器登录（独立入口：python lanes/oauth.py）
+  tests/                   离线测试（打桩 _upstream / _hmac_headers，不连真实上游）
+
+server.py 只留公共设施：签名、上游发送与重试、模型同步、dumps 抓包、
+请求日志、管理面板与路由挂载。路由体一律经 register(app, core) 的 core
+（即本模块）动态查找引擎函数，测试对 server 上这些名字的打桩因此对
+路由层同样生效。
+
 启动方式:
     pip install -r requirements.txt
     python server.py
@@ -29,10 +45,11 @@ from dotenv import load_dotenv
 from flask import Flask, Response, g, jsonify, request
 from requests.adapters import HTTPAdapter
 
-import benefit
-import credential_provider
-import responses_bridge as rb
-import anthropic_bridge as ab
+from adapters import anthropic, responses as responses_adapter
+from lanes import benefit, credential_provider, oauth  # noqa: F401  (oauth 仅登录时用)
+from routes import chat as chat_route
+from routes import messages as messages_route
+from routes import responses as responses_route
 
 load_dotenv()
 
@@ -1007,471 +1024,6 @@ def _send_upstream(req_json: dict, model: str, benefit: bool):
         )
 
 
-@app.route("/v1/chat/completions", methods=["POST", "OPTIONS"])
-def chat_completions():
-    if request.method == "OPTIONS":
-        return _cors(Response(""))
-
-    body = request.get_data()
-    if not body:
-        return _cors(jsonify({"error": {"message": "empty body"}})), 400
-    try:
-        req_json = json.loads(body)
-    except Exception:
-        return _cors(jsonify({"error": {"message": "invalid JSON body"}})), 400
-
-    # 清洗悬空 tool_calls / 孤儿 tool 消息（客户端中断后上游会拒整条历史）
-    _sanitize_tool_calls(req_json)
-
-    # 模型名归一化；请求聊天时也按短缓存周期同步一次模型列表
-    _refresh_models_if_needed()
-    model = req_json.get("model", SUPPORTED_MODELS[0])
-    if model not in SUPPORTED_MODELS:
-        # 先给缓存一次同步纠正的机会：福利模型是动态投放的，后台刷新还没落地时
-        # 本地会误判成"不存在"直接 404（实测 2026-10-14 05:01 那串 404 即此）。
-        if not _force_sync_models_for(model):
-            return (
-                _cors(
-                    jsonify(
-                        {
-                            "error": {
-                                # 带上当前可用列表：原来只说"不在可用列表中"，
-                                # 得去翻 models-cache.json 才知道能填什么。
-                                "message": (
-                                    f"model '{model}' 不在当前账号可用模型列表中，"
-                                    f"可用：{', '.join(SUPPORTED_MODELS)}"
-                                ),
-                                "type": "invalid_request_error",
-                                "param": "model",
-                                "code": "model_not_found",
-                            }
-                        }
-                    )
-                ),
-                404,
-            )
-        logger.info("模型 %s 经强制同步后命中，继续处理请求", model)
-    req_json["model"] = model
-    # 输出上限必须在签名前收敛：签名覆盖 body 哈希，钳制必须在重序列化之前完成
-    _clamp_max_tokens(req_json)
-
-    # 通道判断：AgentCenter 老套餐模型用基础签名；其余（免费 benefit 模型）
-    # 必须带 maas_type/model-id/model-name 三个签名头，否则上游报未注册。
-    benefit = model not in AGENT_MODELS
-
-    # 客户端是否要流式
-    want_stream = bool(req_json.get("stream", False))
-
-    if not want_stream:
-        # 实测 2026-10-14：GLM-5.2 / openpangu-2.0-flash 在 stream=false 下返回
-        # message.content=""（正文丢在上游，usage 里却呯地计入 reasoning_tokens），
-        # 而同样提问走流式能正常拿到结果。因此统一向上游要流，
-        # 由下方 _parse_upstream_json 聚合成单个 JSON：对客户端仍是非流式。
-        req_json["stream"] = True
-
-    # 签名/发送/重试统一走 _send_upstream（与 responses 路由共用）
-    upstream, err = _send_upstream(req_json, model, benefit)
-    if err is not None:
-        return err
-
-    if want_stream:
-        # generate() 是惰性生成器，迭代时请求上下文已结束，不能再碰 flask.g
-        # （否则抛 "Working outside of application context" → 客户端收到 HTML 500）。
-        # 请求期就把上下文字段抓成局部变量供生成器闭包使用。
-        rid, t0 = g.rid, g.t0
-
-        def generate():
-            """严格转发为 OpenAI SSE；仅对 benefit 流补齐缺失的结束原因。"""
-            content_type = (upstream.headers.get("Content-Type") or "").lower()
-            is_benefit = model not in AGENT_MODELS
-            saw_done = False
-            saw_finish_reason = False
-
-            # 上游偶尔会在请求 stream=true 时返回普通 JSON，包装成单个 SSE 帧。
-            if "text/event-stream" not in content_type:
-                try:
-                    result = _parse_upstream_json(upstream)
-                except Exception as error:
-                    # 状态码已发出，只能以错误帧收尾，别让流无声断掉
-                    logger.error("[%s] 非 SSE 响应读取中断: %s: %s",
-                                 rid, type(error).__name__, error)
-                    yield b"data: " + json.dumps(
-                        {"error": {"message": "upstream stream interrupted: %s" % error,
-                                  "type": "upstream_error",
-                                  "code": type(error).__name__}},
-                        ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n\n"
-                    yield b"data: [DONE]\n\n"
-                    return
-                for choice in result.get("choices") or []:
-                    if choice.get("finish_reason") in (None, "other"):
-                        choice["finish_reason"] = "stop"
-                payload = json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-                yield b"data: " + payload + b"\n\n"
-                yield b"data: [DONE]\n\n"
-                return
-
-            # iter_lines 在读响应体阶段抛的是原生传输异常（读超时、连接被复位、
-            # chunked 流断裂）。此时状态码已经发出去，改不了，只能先记下来，
-            # 循环结束后用 SSE 错误帧收尾，避免客户端只看到一条被掐断的流。
-            broken = {"error": None}
-
-            def upstream_lines():
-                try:
-                    for raw_line in upstream.iter_lines(decode_unicode=False):
-                        yield raw_line
-                except Exception as error:
-                    broken["error"] = error
-
-            for raw_line in upstream_lines():
-                if not raw_line:
-                    continue
-                if not raw_line.startswith(b"data:"):
-                    if raw_line.startswith(b":"):
-                        yield raw_line + b"\n\n"
-                    continue
-
-                payload = raw_line[5:].strip()
-                if payload == b"[DONE]":
-                    # benefit 流需要先确认是否缺少 finish_reason；agent 流则保持
-                    # 原来的即时转发行为，避免改变 agent 客户端状态机。
-                    if not is_benefit:
-                        if not saw_done:
-                            yield b"data: [DONE]\n\n"
-                            saw_done = True
-                    else:
-                        saw_done = True
-                    continue
-                try:
-                    chunk = json.loads(payload.decode("utf-8"))
-                    # 上游错误帧（如 InferHub.001001005.400 param invalid）：
-                    # 原样透传会被 Agent Runtime 当成空响应 → "no content and no
-                    # tool calls" 无限重试。转成 OpenAI error 帧并终止流，让
-                    # 客户端直接看到真实原因。
-                    if chunk.get("error_code") or chunk.get("error_msg"):
-                        err_text = "%s %s" % (chunk.get("error_code") or "",
-                                              chunk.get("error_msg") or "upstream error")
-                        logger.error("[%s] 流中上游错误帧: %s", rid, err_text)
-                        yield b"data: " + json.dumps(
-                            {"error": {"message": err_text.strip(),
-                                       "type": "upstream_error",
-                                       "code": chunk.get("error_code")}},
-                            ensure_ascii=False, separators=(",", ":")
-                        ).encode("utf-8") + b"\n\n"
-                        yield b"data: [DONE]\n\n"
-                        saw_done = True
-                        return
-                    for choice in chunk.get("choices") or []:
-                        reason = choice.get("finish_reason")
-                        if reason is not None:
-                            saw_finish_reason = True
-                            if reason == "other":
-                                choice["finish_reason"] = "stop"
-                        # DeepSeek benefit 流会发送 content:null、reasoning_content 有值。
-                        # 部分 Agent Runtime 只接受字符串 content，会将 null chunk
-                        # 误判为无响应；OpenAI 兼容格式中空字符串表达同样语义。
-                        delta = choice.get("delta")
-                        if isinstance(delta, dict) and delta.get("content") is None:
-                            delta["content"] = ""
-                    payload = json.dumps(chunk, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-                    yield b"data: " + payload + b"\n\n"
-                except (UnicodeDecodeError, json.JSONDecodeError):
-                    continue
-
-            # 上游把流掐断了：先给客户端一个明确的错误帧，再把异常原样抛出，
-            # 保留 _stream_log 的 "stream 中断" 日志与堆栈。这里必须跳过下面的
-            # 补尾逻辑，否则会给半截回答补一个 finish_reason=stop，伪装成正常收尾。
-            if broken["error"] is not None:
-                error = broken["error"]
-                if not saw_done:
-                    yield b"data: " + json.dumps(
-                        {"error": {"message": "upstream stream interrupted: %s" % error,
-                                  "type": "upstream_error",
-                                  "code": type(error).__name__}},
-                        ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n\n"
-                    yield b"data: [DONE]\n\n"
-                raise error
-
-            # 只对免费 benefit 模型补齐完全缺失的 finish_reason；不重发任何上游 chunk。
-            if is_benefit and not saw_finish_reason:
-                yield b"data: " + json.dumps(
-                    {
-                        "id": "proxy-finish",
-                        "object": "chat.completion.chunk",
-                        "created": int(time.time()),
-                        "model": model,
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                    }, ensure_ascii=False, separators=(",", ":")
-                ).encode("utf-8") + b"\n\n"
-            if is_benefit and not saw_done:
-                yield b"data: [DONE]\n\n"
-            elif is_benefit:
-                # 上游 [DONE] 被延迟到这里，确保补块在 [DONE] 之前。
-                yield b"data: [DONE]\n\n"
-            # agent 分支保持原有行为：如果上游异常断流、没有发送 [DONE]，
-            # 代理仍补一个 [DONE]，与修改前的实现一致。
-            if not is_benefit and not saw_done:
-                yield b"data: [DONE]\n\n"
-
-        resp = Response(_stream_log(generate(), rid, t0), status=200,
-                        mimetype="text/event-stream")
-        resp.headers["Cache-Control"] = "no-cache, no-transform"
-        resp.headers["Content-Type"] = "text/event-stream; charset=utf-8"
-        resp.headers["X-Accel-Buffering"] = "no"
-        return _cors(resp)
-
-    # 非流式：无论上游返回 JSON 还是 SSE，都统一聚合成单个 JSON。
-    # CodeArts 在排队、重试或特定模型场景下可能即使请求 stream=false
-    # 仍返回 text/event-stream；直接转发会导致客户端把 data: 当作 JSON 解析。
-    try:
-        result = _parse_upstream_json(upstream)
-    except Exception as error:
-        # 读正文时连接被掐：状态码还没发出去，可以正常报错。不接住会变成 Flask
-        # 默认 500 HTML 页，客户端拿到的是 "500 Internal Server Error" 而非原因。
-        logger.error("[%s] 上游响应读取中断: %s: %s", g.rid, type(error).__name__, error)
-        return (
-            _cors(jsonify({"error": {"message": "upstream stream interrupted: %s" % error,
-                                    "type": "upstream_error",
-                                    "code": type(error).__name__}})),
-            502,
-        )
-    if isinstance(result, dict) and result.get("error"):
-        logger.error("[%s] [502] 上游业务错误: %s", g.rid, result.get("error"))
-        resp = Response(
-            json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
-            status=502,
-            content_type="application/json; charset=utf-8",
-        )
-        return _cors(resp)
-    output = json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    resp = Response(output, status=200, content_type="application/json; charset=utf-8")
-    return _cors(resp)
-
-
-# ── OpenAI Responses 端点（grok-build / Codex 等原生 Responses 客户端）──────
-@app.route("/v1/responses", methods=["POST", "OPTIONS"])
-def responses_api():
-    """Responses 协议入口：请求体经 responses_bridge 转成 Chat 后走既有上游
-    管线（签名/鉴权/重试全部复用），响应侧把 Chat SSE 包回 Responses SSE
-    （每帧带 sequence_number，grok 类型级强制）。"""
-    if request.method == "OPTIONS":
-        return _cors(Response(""))
-
-    body = request.get_data()
-    if not body:
-        return _cors(jsonify({"error": {"message": "empty body"}})), 400
-    try:
-        req_json = json.loads(body)
-    except Exception:
-        return _cors(jsonify({"error": {"message": "invalid JSON body"}})), 400
-    if not isinstance(req_json, dict):
-        return _cors(jsonify({"error": {"message": "invalid JSON body"}})), 400
-
-    chat_req = rb.responses_to_chat(req_json)
-    if not chat_req.get("messages"):
-        return _cors(jsonify({"error": {"message": "empty input"}})), 400
-
-    # 与 chat 路径同款的清洗/归一化/钳制（签名前完成）
-    _sanitize_tool_calls(chat_req)
-    _refresh_models_if_needed()
-    model = chat_req.get("model", SUPPORTED_MODELS[0])
-    if model not in SUPPORTED_MODELS:
-        # 先给缓存一次同步纠正的机会：福利模型动态投放，同 chat 路径注释
-        if not _force_sync_models_for(model):
-            return (
-                _cors(
-                    jsonify(
-                        {
-                            "error": {
-                                "message": (
-                                    f"model '{model}' 不在当前账号可用模型列表中，"
-                                    f"可用：{', '.join(SUPPORTED_MODELS)}"
-                                ),
-                                "type": "invalid_request_error",
-                                "param": "model",
-                                "code": "model_not_found",
-                            }
-                        }
-                    )
-                ),
-                404,
-            )
-        logger.info("模型 %s 经强制同步后命中，继续处理请求", model)
-    chat_req["model"] = model
-    _clamp_max_tokens(chat_req)
-
-    benefit = model not in AGENT_MODELS
-    want_stream = bool(chat_req.get("stream", False))
-    if not want_stream:
-        # 同 chat 路径：统一向上游要流，非流式在此聚合成单个 Responses JSON
-        chat_req["stream"] = True
-
-    upstream, err = _send_upstream(chat_req, model, benefit)
-    if err is not None:
-        return err
-
-    if want_stream:
-        # 同 chat 路径：生成器迭代时请求上下文已结束，先抓上下文字段
-        rid, t0 = g.rid, g.t0
-        is_sse = "text/event-stream" in (upstream.headers.get("Content-Type") or "").lower()
-
-        def generate():
-            if is_sse:
-                # 常规：Chat SSE 逐帧包成 Responses SSE
-                for frame in rb.chat_sse_to_responses(
-                        upstream.iter_lines(decode_unicode=False), model):
-                    yield frame
-                return
-            # 上游偶尔 stream=true 仍回普通 JSON：聚合成单个 Chat JSON，
-            # 再以最小 Responses SSE 序列发出，客户端拿到的仍是合法流。
-            try:
-                result = _parse_upstream_json(upstream)
-            except Exception as error:
-                logger.error("[%s] [responses] 非 SSE 响应读取中断: %s: %s",
-                             rid, type(error).__name__, error)
-                for f in rb.response_json_to_sse(
-                        rb.error_response_obj(
-                            model, "upstream_error",
-                            "upstream stream interrupted: %s" % error)):
-                    yield f
-                return
-            if isinstance(result, dict) and result.get("error"):
-                logger.error("[%s] [responses] [502] 上游业务错误: %s",
-                             rid, result.get("error"))
-                for f in rb.response_json_to_sse(
-                        rb.error_response_obj(model, "upstream_error",
-                                              str(result.get("error")))):
-                    yield f
-                return
-            for f in rb.response_json_to_sse(
-                    rb.chat_json_to_responses(result, model)):
-                yield f
-
-        resp = Response(_stream_log(generate(), rid, t0), status=200,
-                        mimetype="text/event-stream")
-        resp.headers["Cache-Control"] = "no-cache, no-transform"
-        resp.headers["Content-Type"] = "text/event-stream; charset=utf-8"
-        resp.headers["X-Accel-Buffering"] = "no"
-        return _cors(resp)
-
-    # 非流式：聚合成单个 Responses JSON
-    try:
-        result = _parse_upstream_json(upstream)
-    except Exception as error:
-        logger.error("[%s] [responses] 上游响应读取中断: %s: %s",
-                     g.rid, type(error).__name__, error)
-        return (
-            _cors(jsonify({"error": {"message": "upstream stream interrupted: %s" % error,
-                                    "type": "upstream_error",
-                                    "code": type(error).__name__}})),
-            502,
-        )
-    if isinstance(result, dict) and result.get("error"):
-        logger.error("[%s] [responses] [502] 上游业务错误: %s", g.rid, result.get("error"))
-        return (
-            _cors(jsonify({"error": {"message": str(result.get("error")),
-                                    "type": "upstream_error",
-                                    "code": "upstream_error"}})),
-            502,
-        )
-    return _cors(jsonify(rb.chat_json_to_responses(result, model)))
-
-
-# ── Anthropic Messages 端点（Claude Code 等原生 Anthropic 客户端）──────────────
-# 与 /v1/responses 同构：anthropic_bridge 把 Anthropic ⇄ Chat 翻掉，复用
-# 既有上游管线（签名/鉴权/重试）；响应侧包成 Anthropic SSE。
-@app.route("/v1/messages", methods=["POST"])
-def messages_api():
-    if request.method == "OPTIONS":
-        return _cors(Response(""))
-
-    body = request.get_data()
-    if not body:
-        return _cors(jsonify(ab.error_body("invalid_request_error", "empty body"))), 400
-    try:
-        req_json = json.loads(body)
-    except Exception:
-        return _cors(jsonify(ab.error_body("invalid_request_error", "invalid JSON body"))), 400
-    if not isinstance(req_json, dict):
-        return _cors(jsonify(ab.error_body("invalid_request_error", "invalid JSON body"))), 400
-
-    chat_req = ab.anthropic_to_chat(req_json)
-    if not chat_req.get("messages"):
-        return _cors(jsonify(ab.error_body("invalid_request_error", "empty messages"))), 400
-
-    _sanitize_tool_calls(chat_req)
-    _refresh_models_if_needed()
-    model = chat_req.get("model", SUPPORTED_MODELS[0])
-    if model not in SUPPORTED_MODELS:
-        if not _force_sync_models_for(model):
-            return (
-                _cors(jsonify(ab.error_body("invalid_request_error",
-                    "model '%s' 不在当前账号可用模型列表中，可用：%s" % (model, ", ".join(SUPPORTED_MODELS))))),
-                404,
-            )
-        logger.info("模型 %s 经强制同步后命中，继续处理请求", model)
-    chat_req["model"] = model
-    _clamp_max_tokens(chat_req)
-
-    benefit = model not in AGENT_MODELS
-    want_stream = bool(chat_req.get("stream", False))
-    if not want_stream:
-        chat_req["stream"] = True
-
-    upstream, err = _send_upstream(chat_req, model, benefit)
-    if err is not None:
-        return err
-
-    if want_stream:
-        rid, t0 = g.rid, g.t0
-        is_sse = "text/event-stream" in (upstream.headers.get("Content-Type") or "").lower()
-
-        def generate():
-            if is_sse:
-                for frame in ab.chat_sse_to_anthropic(
-                        upstream.iter_lines(decode_unicode=False), model):
-                    yield frame
-                return
-            try:
-                result = _parse_upstream_json(upstream)
-            except Exception as error:
-                logger.error("[%s] [messages] 非 SSE 响应读取中断: %s: %s",
-                             rid, type(error).__name__, error)
-                yield ab.error_sse("api_error",
-                    "upstream stream interrupted: %s" % error)
-                return
-            if isinstance(result, dict) and result.get("error"):
-                logger.error("[%s] [messages] [502] 上游业务错误: %s",
-                             rid, result.get("error"))
-                yield ab.error_sse("api_error", str(result.get("error")))
-                return
-            for frame in ab.chat_json_to_anthropic_sse(result, model):
-                yield frame
-
-        resp = Response(_stream_log(generate(), rid, t0), status=200,
-                        mimetype="text/event-stream")
-        resp.headers["Cache-Control"] = "no-cache, no-transform"
-        resp.headers["Content-Type"] = "text/event-stream; charset=utf-8"
-        resp.headers["X-Accel-Buffering"] = "no"
-        return _cors(resp)
-
-    try:
-        result = _parse_upstream_json(upstream)
-    except Exception as error:
-        logger.error("[%s] [messages] 上游响应读取中断: %s: %s",
-                     g.rid, type(error).__name__, error)
-        return (
-            _cors(jsonify(ab.error_body("api_error", "upstream stream interrupted: %s" % error))),
-            502,
-        )
-    if isinstance(result, dict) and result.get("error"):
-        logger.error("[%s] [messages] [502] 上游业务错误: %s", g.rid, result.get("error"))
-        return (
-            _cors(jsonify(ab.error_body("api_error", str(result.get("error"))))),
-            502,
-        )
-    return _cors(jsonify(ab.chat_json_to_anthropic(result, model)))
-
-
 # ── 积分余额（snap-access 网关，agent 通道模型消耗）──────────────────────
 _credit_cache = {"at": 0.0, "data": None}
 
@@ -1652,6 +1204,25 @@ def _benefit_checkin_loop():
             except Exception as error:
                 print(f"[签到] {today} 限时福利领取失败: {error}")
         time.sleep(3600)
+
+
+# ── 兼容旧引用（协议层与通道层已分包，旧平铺模块名不再可用）──────────────────
+# 旧代码/探针里 `import anthropic_bridge` / `import responses_bridge` 的写法
+# 已失效；这里以属性别名兜住 `server.anthropic_bridge` 一类的访问。
+anthropic_bridge = anthropic
+responses_bridge = responses_adapter
+
+
+# ── 协议路由层挂载（routes/）：每协议一个文件，本文件只做调度 ──────────────────
+# register(app, core) 里 core 传本模块：路由经模块属性动态查找引擎函数
+# （_send_upstream / _clamp_max_tokens / _sanitize_tool_calls / SUPPORTED_MODELS 等），
+# 测试对 server 上这些名字的打桩替换因此对路由层同样生效。
+import sys as _sys
+
+_core = _sys.modules[__name__]
+chat_route.register(app, _core)
+responses_route.register(app, _core)
+messages_route.register(app, _core)
 
 
 if __name__ == "__main__":

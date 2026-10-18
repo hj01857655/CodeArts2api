@@ -14,7 +14,11 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="repla
 os.environ["DUMP"] = "0"          # 不落盘 dumps
 os.environ["CODEARTS_BENEFIT_AUTO_CLAIM"] = "0"
 
-sys.path.insert(0, r"E:\VSCodeSpace\Agent\CodeArts\CodeArts2api")
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+sys.path.insert(0, ROOT)
+sys.path.insert(0, HERE)
+
 import requests  # noqa: E402
 import server    # noqa: E402
 

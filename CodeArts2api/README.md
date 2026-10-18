@@ -16,8 +16,8 @@
 
 ```bash
 pip install -r requirements.txt
-python oauth.py        # 浏览器登录获取凭证
-python server.py       # 启动代理
+python lanes/oauth.py    # 浏览器登录获取凭证
+python server.py         # 启动代理
 ```
 
 ```
@@ -43,14 +43,14 @@ Model    : openpangu-2.0-pro、glm-5.3-flash、deepseek-v4-flash-0731 …
 客户端                 proxy 翻译层              上游（仅 Chat）
 ─────────            ─────────────            ─────────────
 Chat Completions ──→  直通                 ──→  InferHub /chat/completions
-Responses        ──→  responses_bridge     ──→  InferHub /chat/completions
+Responses        ──→  adapters/responses    ──→  InferHub /chat/completions
                       （请求翻 Chat；响应重放 Responses 事件流——sequence_number
                         递增、终帧携带聚合全文与 usage）
-Anthropic        ──→  anthropic_bridge     ──→  InferHub /chat/completions
+Anthropic        ──→  adapters/anthropic    ──→  InferHub /chat/completions
                       （双向翻译）
 ```
 
-Chat 是上游母语；Responses / Anthropic 均为「方言 ⇄ 母语」双向翻译层。`cache_control` 与 Anthropic 入站 `thinking` 配置无 Chat 对应项，翻译时丢弃；上游输出思维链时经 `reasoning_content` 返回，Responses 客户端以 `reasoning_summary_*` 事件收到。
+Chat 是上游母语；Responses / Anthropic 均为「方言 ⇄ 母语」双向翻译层（`adapters/`）。`cache_control` 与 Anthropic 入站 `thinking` 配置无 Chat 对应项，翻译时丢弃；上游输出思维链时经 `reasoning_content` 返回，Responses 客户端以 `reasoning_summary_*` 事件收到。
 
 ## 配置
 
@@ -77,11 +77,11 @@ Chat 是上游母语；Responses / Anthropic 均为「方言 ⇄ 母语」双向
 ### 福利签到
 
 ```bash
-python benefit.py            # 全部：Token 签到 + 积分签到 + 余额
-python benefit.py status     # 查签到状态
-python benefit.py claim      # 领每日 1000 万福利 Token
-python benefit.py credit     # 领每日 1000 积分 + 查余额
-python benefit.py models     # 查免费模型列表
+python lanes/benefit.py            # 全部：Token 签到 + 积分签到 + 余额
+python lanes/benefit.py status     # 查签到状态
+python lanes/benefit.py claim      # 领每日 1000 万福利 Token
+python lanes/benefit.py credit     # 领每日 1000 积分 + 查余额
+python lanes/benefit.py models     # 查免费模型列表
 ```
 
 ## 已知限制

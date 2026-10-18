@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""responses_bridge 独立验证（不依赖 Flask / 上游）：
+"""adapters/responses 独立验证（不依赖 Flask / 上游）：
   1. 流式转换：reasoning + 正文 + tool_calls + usage + [DONE]
   2. 每帧 sequence_number 从 0 单调递增
   3. 事件生命周期与 Response/usage 必填字段
@@ -9,8 +9,14 @@
   7. 上游断流 -> response.incomplete
 """
 import json
+import os
+import sys
 
-import responses_bridge as rb
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+sys.path.insert(0, ROOT)
+
+from adapters import responses as rb  # noqa: E402
 
 
 def sse(obj):
