@@ -214,13 +214,17 @@ balance 在会话期间被重复调用（同一时间窗内观察到 4 次以上
 
 | 端点 | 用途 |
 |---|---|
-| `/v1/ops/delivery` | **福利发放** |
-| `/v1/ops/claim` | 福利领取 |
-| `/v1/ops/confirm` | 福利确认 |
-| `/v1/ops/invite/generate` | 邀请码生成 |
+| `/v1/ops/delivery` | **福利发放**（活动列表，GET）|
+| `/v1/ops/claim` | 福利领取（POST）|
+| `/v1/ops/confirm` | 福利确认（POST）|
+| `/v1/ops/invite/generate` | **邀请码与邀请链接生成**（POST-only；GET 返 `method GET not found` 404，不是前端路由）|
 | `/v1/ops/events/conversation` | 会话事件上报 |
 | `/v1/ops/tasks/conversation` | 任务事件上报 |
-| `/v1/ops/credit/usage` | 会话级用量查询（`type`/`id`）|
+| `/v1/ops/credit/usage` | 会话级用量查询（`type=session\|msg` + `id`）|
+
+**这一族里没有「查询认证状态」的端点。** `/v1/ops/pages/{id}` 看着像详情页，实测 GET 404（`APIG.0101`），是纯前端路由。邀请活动可拿链接（`invite/generate`）但**不能代领奖励**——必须真人通过链接注册，服务端对直接领取会返回「该活动类型需要先通过触发接口激活」。
+
+> ⚠️ 别把这个 404 和 `invite/generate` 的 404 搞混：前者是**真的纯前端路由**（GET 就该 404），后者是 **POST-only 接口被 GET 打**（`method GET not found`）。判据是看 `message` 里有没有方法名。
 
 ### 6.3 活动福利（`/v1/ops/delivery`）：对话完成即自动发放
 
@@ -240,12 +244,12 @@ balance 在会话期间被重复调用（同一时间窗内观察到 4 次以上
 |---|---|
 | `campaignId` | 活动 ID |
 | `title` | 活动名|
-| `type` | `CUSTOM`（自定义任务）/ `INVITE_USER`（邀请）|
+| `type` | 实测出现：`USER_LOGIN` / `NEW_USER_REGISTER` / `STUDENT_CERTIFIED` / `INVITE_USER` / `CUSTOM` |
 | `benefitAmount` | 奖励数量 |
 | `benefitUnit` | **`CREDIT`**（积分，与 token 是不同单位）|
-| `pageUrl` | 活动详情页 `/v1/ops/pages/{id}` |
-| `claimable` | 是否可领取 |
-| `status` | `ELIGIBLE` / `CLAIMED` / `CONFIRMED` / `CONSUMED` |
+| `pageUrl` | 活动详情页 `/v1/ops/pages/{id}`（实测 GET 404，纯前端路由）|
+| `claimable` | **是否可领取——自动化领取的唯一门槛** |
+| `status` | `null`（未触发）/ `CLAIMED`（领了没确认）/ `CONFIRMED`（已确认）/ `CONSUMED`（已用完）。**没有 `ELIGIBLE`** |
 | `pendingCount` | 待领取笔数 |
 | `pendingTotalAmount` | 待领取总额 |
 | `access[]` | 跳转链接（含 ES256 ticket，有效期约 1 天）|
@@ -260,7 +264,7 @@ balance 在会话期间被重复调用（同一时间窗内观察到 4 次以上
 | `startTime` / `endTime` | 活动起止（UTC）|
 | `consumePriority` | 消耗优先级 |
 
-`displayConfig.claimButtonText` 按状态给不同按钮文案：`ELIGIBLE`空 / `CLAIMED`「已领取」/ `CONFIRMED`「已确认」/ `CONSUMED`「已耗尽」/ `ENTRY`「去完成任务」。
+`displayConfig.claimButtonText` 按状态给不同按钮文案，键位是 `ELIGIBLE` / `CLAIMED`「已领取」/ `CONFIRMED`「已确认」/ `CONSUMED`「已耗尽」/ `ENTRY`「去完成任务」。注意这些键名是**按钮文案的查表键**，不等于 `status` 字段的取值——`status` 实测只有 `null`/`CLAIMED`/`CONFIRMED`/`CONSUMED`。
 
 #### 实测活动清单
 
@@ -273,6 +277,54 @@ balance 在会话期间被重复调用（同一时间窗内观察到 4 次以上
 #### 结论：对话即产生积分
 
 活动 17 的触发条件是 `conversation.completed` + `AUTO_GRANT`——**完成一次对话自动发放 88 积分，无需手动领取**。这与内核层「每日领取 token 额度」是两套独立机制：前者按**行为**（对话次数）奖励，后者按**周期**（每日）发放。
+
+> ⚠️ 上面这张清单是**某一时刻的快照**，活动会上下线（17/18 现已不在列表里）。
+> 以 `GET /v1/ops/delivery` 实时返回为准。当前实测清单见 07 号 §8.6。
+
+#### 领取门槛：只有 `claimable`
+
+自动化领取只看一个字段：**上游说 `claimable=true` 才领**。不按 `type` 白名单筛，也不按 `campaignId` 硬编码（后者是自增字段，随活动上下线漂）。
+
+两类容易被误判的活动：
+
+| 活动 | `triggerEvent` | 为什么脚本造不出 | `claimable` 何时翻 true |
+|---|---|---|---|
+| `STUDENT_CERTIFIED` | `student.certified` | 要上传证件等人工审核 | 审核通过后服务端认可资格 |
+| `INVITE_USER` | `invite.success` | 要真人通过邀请链接注册 | 有真实好友注册后 |
+
+`triggerEvent` 必须由**真实事件**才会触发，脚本代劳服务端也会拒绝直接领取。而一旦 `claimable` 翻 true，说明资格已被认可，此时 claim→confirm 只是收款。**`type` 白名单防不住「脚本代劳」，只会挡住「事后收款"。**
+
+**上游没有「查询认证状态」的接口。** `/v1/ops/*` 全是活动/用量/事件类，`/v1/ops/pages/{id}` 实测 404（纯前端路由）。认证进度只能去账号中心页面看；`claimable` 由 false 翻 true 就是唯一信号。
+
+**`AUTO_GRANT` 一律不 claim。** 服务端自己发的活动，打一次 claim 只是白费请求；也防上游哪天给这类活动标 `claimable=true`。
+
+**必须回读。** claim 返回 200 只代表上游受理，不代表积分到账。完整闭环是 delivery → claim → confirm → **回读**，只认 `CONFIRMED`/`CONSUMED`/`CLAIMED` 算成功。
+
+状态语义与四步闭环的完整说明、同赛道四家实现的对照，见 **07 号 §8.6**。
+
+#### 邀请链接：只拿链接，不代领
+
+`POST /v1/ops/invite/generate`，请求体只要 `{"campaignId": 3}`，返回邀请码与邀请链接：
+
+| 字段 | 说明 |
+|---|---|
+| `inviteCode` | 邀请码（约 180 字符，URL 里原样带着走） |
+| `inviteUrl` | `https://devcloud.cn-north-4.huaweicloud.com/chat?…&invitecode=INV-vnu-…` |
+| `activationCount` / `maxActivations` | 已邀请人数 / 上限（实测 `0 / 50`） |
+| `valid` | 邀请码是否有效，`false` 时前端标「已失效」 |
+| `inviterUserId` / `inviterCustomerId` | 账号标识，只读回显 |
+
+实测三条：
+
+1. **POST-only**，GET 回 `method GET not found` 404（与 `/v1/ops/pages/{id}` 的纯前端
+   路由 404 是两回事，判据看 `message` 里有没有方法名）。
+2. **幂等「生成或取回」**：连调三次返回同一条码。网关侧因此可缓存 1 小时，
+   刷新面板不会反复打上游。
+3. **campaignId 从 `delivery` 里现找**（`type=INVITE_USER` 取最小），常量只兜底——
+   邀请活动 **2026-11-15 截止**，比学生认证（2026-12-30）早。
+
+链接发给好友、对方注册成功后，服务端记 `invite.success` 并把活动 `claimable` 翻 true，
+之后走四步闭环收款。**中间两步脚本替不了**，所以邀请功能只到「拿到链接」为止。
 
 ### 6.4 会话级用量（`/v1/ops/credit/usage`）
 

@@ -667,7 +667,181 @@ V1（`/v1/chat/chat`）上游回流为**逐行 `data:` JSON**（无空行分隔�
 
 **权益获取（每日额度领取）、接口契约、完整错误码表见 08 号。**
 
-## 8. 本次请求的完整语义复原
+## 8. 并发闸门：`user-session-id` + heartbeat busy/idle
+
+上游对每个账号只放 **3 路并发对话**，放不下时报 `TM.00001041`（HTTP 400，
+文案「并发会话数已达上限(3个)」）。关键点：**这个闸门不认「请求结束」**，
+只认心跳的 busy/idle 两个状态。源码与抓包双向确认：
+
+```
+PUT /snap-manager/v1/chat-session/heartbeat?status=busy|idle   → {"status":"ok"}
+```
+
+### 8.1 我们踩的坑
+
+codearts2api 此前既不发心跳、请求里也不带 `user-session-id`，于是：
+
+1. 每个请求让上游**隐式开一个会话，且永不注销**；
+2. 3 个槽很快被占满，之后一律 `TM.00001041`；
+3. 我们的退避重试等的是别人释放，而上游只肯按超时回收 —— 白等 12 s 后回 502。
+
+实测辨析（2026-10-20）：**4 个 busy 全部成功，没有 3 个上限**。说明闸门绑的是
+**真实对话请求**，不是 busy 计数；心跳只是登记/注销的开关。因此请求体/头必须
+带上同一个 `user-session-id`，busy 与 chat 才能归到同一条会话上。
+
+### 8.2 实现（`lanes/session.py`）
+
+| 件 | 职责 |
+|---|---|
+| `ChatSession` | busy → 每 30 s 续期 → idle；session id **自造**（UUIDv4 去连字符，32 位 hex） |
+| `SessionGate` | 本地准入闸，按账号计在途数，满员回 **409** |
+| `TrackedResponse` | 包住上游响应，正文读完/连接关闭时才还槽 |
+
+五条必须守住的性质（对应参考实现 `Agent2API/agent2api` `session.rs` 的规则，
+离线测试 `tests/test_session_gate.py` 逐条覆盖）：
+
+1. **周期 busy 续期失败不释放槽位** —— 一次网络抖动不该废掉在途请求；
+2. **首次 busy 非 200 仍要注销自己造的 id** —— 上游可能已把它记成半开会话；
+3. **只注销自己造的 id** —— 绝不能拿 IDE 的 `ses_*` 去 idle，那会杀掉用户正在用的会话；
+4. **idle 只发一次，且在最后一个在途 busy 之后** —— 由 `_io_lock` 串行保证；
+   `_closing` 的判断放在锁内，否则会出现「idle 之后又来一个 busy」的槽位泄漏；
+5. **本地准入满员回 409，不是 429** —— 429 会被客户端当成额度耗尽进入长冷却，
+   而这个条件几十毫秒内就会自己消失。
+
+签名侧：心跳签名**带 Host**（区域 API 反而不带，两者不能混用签名函数），因此
+`server.py` 的通用 `_signed_request` 正好可复用，而 `_hmac_headers` 的
+`canonical_uri` 写死成 `/api/v2/chat/completions/`，不能用来签心跳。
+
+### 8.3 闸门身份：绝不能用 AK
+
+闸门 key 是 `sha256(base_url + "\n" + account_id)`。**AK 每次续期都换**，拿它当
+身份会让「同一账号」每刷一次期就变成一个新闸门口，3 路上限被悄悄重置，等于没限。
+稳定来源（`lanes/credential_provider.py`）：
+
+| 路径 | account_id 来源 | 是否跨 AK 轮换稳定 |
+|---|---|---|
+| `auths/*.json`（oauth.py 登录） | 文件名 `codearts-<hash>` | ✅ |
+| IDE 会话 | `account.id`（登录账号主键） | ✅ |
+| 回退 | `domainId` / `userId` / `userName` | ✅ 账号级 |
+
+### 8.4 还槽时机：不能放在 `_send_upstream` 的 finally
+
+三条路由都是在 `_send_upstream` 返回**之后**才消费响应体（流式尤其晚，客户端断在
+哪儿都可能）。在那里 finally 还槽，等于闸门只覆盖到「上游收下请求」那一刻。
+所以由 `TrackedResponse` 在 `content` / `text` / `json()` / `iter_lines()` /
+`close()` 五个出口收口，且每个出口都带 `try/finally` —— 读正文时连接被掐同样要
+还槽，否则每出一次读失败就漏一个槽，攒够 3 个之后服务自己把自己限死。
+
+### 8.5 环境变量
+
+| 变量 | 默认 | 作用 |
+|---|---|---|
+| `CODEARTS_SESSION_HEARTBEAT` | `1` | 关掉后仍发 `user-session-id`，只是不主动 busy/idle |
+| `CODEARTS_SESSION_GATE` | `1` | 本地准入闸总开关 |
+| `CODEARTS_SESSION_LIMIT` | `3` | 本地闸门上限（应对应上游真实值） |
+| `CODEARTS_HEARTBEAT_INTERVAL` | `30` | busy 续期间隔（秒） |
+
+### 8.6 积分活动领取：`claimable` 门槛 + 四步闭环
+
+与 heartbeat 同一个 snap 网关（`snap-access.cn-north-4.myhuaweicloud.com`），
+AK/SK 签名即可调，**不需要 IDE 登录态**：
+
+```
+GET  /v1/ops/delivery?channel=IDE   → 活动列表（items[]）
+POST /v1/ops/claim                  → {campaignId, idempotentKey, channel}
+POST /v1/ops/confirm                → {campaignId}
+POST /v1/ops/invite/generate        → {campaignId} 邀请码与邀请链接（**POST-only**）
+GET  /snap-manager/v1/statistics/plugin → 积分余额（usageTotalPackageCredit）
+```
+
+#### 邀请链接（`POST /v1/ops/invite/generate`）
+
+只**拿链接**，不代领奖励。请求体只要一个 `campaignId`（邀请活动实测是 3）：
+
+```json
+{"campaignId": 3}
+```
+
+实测响应（`data` 字段，2026-10-20）：
+
+| 字段 | 实测值 |
+|---|---|
+| `inviteCode` | `INV-vnu-8WoF…`（约 180 字符，URL 里原样带着走） |
+| `inviteUrl` | `https://devcloud.cn-north-4.huaweicloud.com/chat?source=dmzntgwlb&sourcead=dmzntgwlb1&invitecode=INV-vnu-…` |
+| `campaignId` | `3` |
+| `activationCount` / `maxActivations` | `0` / `50`（邀请上限 50 人，与活动描述一致） |
+| `valid` | `true` |
+| `inviterUserId` / `inviterCustomerId` | 账号标识（只读回显，不用来鉴权） |
+| `status` / `createdAt` / `updatedAt` / `channel` / `id` | 邀请码记录自身状态 |
+
+三条实测结论：
+
+1. **GET 会 404**（`method GET not found`）—— 这个端点是 POST-only，探测时别被
+   `404 APIG.0101` 误导成「前端路由」。
+2. **幂等「生成或取回」**：连调三次返回**同一条** `inviteCode`，不会每次换新链接。
+   所以网关侧可以放心缓存（CodeArts2api 缓存 1 h），刷新面板不会反复打上游。
+3. **活动 ID 从 `delivery` 里现找**（`type=INVITE_USER`，取最小 campaignId），
+   常量只作兜底 —— campaignId 是自增字段，邀请活动 2026-11-15 就结束了。
+
+拿到链接后奖励怎么到账：好友通过链接注册 → 服务端记 `invite.success` →
+邀请活动的 `claimable` 翻 true → 走上面的四步闭环收款。脚本替不了中间两步，
+所以邀请功能到此为止，**只到链接**。
+
+实测账号上共 4 个活动，`benefitUnit` 均为 `CREDIT`：
+
+| campaignId | type | 奖励 | triggerMode | 怎么才能领 |
+|---|---|---|---|---|
+| 1 | `USER_LOGIN` | 1000 积分 | `MANUAL_CLAIM` | 每日 `claimable` 自动翻 true |
+| 4 | `NEW_USER_REGISTER` | 4000 积分 | `AUTO_GRANT` | 服务端自动发，**不 claim** |
+| 2 | `STUDENT_CERTIFIED` | 4000 积分 | `MANUAL_CLAIM` | 上传证件审核通过 |
+| 3 | `INVITE_USER` | 1000 积分 | `MANUAL_CLAIM` | 真人通过邀请链接注册 |
+
+**门槛只有一个：上游说 `claimable`。** 不按 type 白名单筛，也不按 campaignId
+硬编码 —— 后者是上游自增字段，会随活动上下线漂。
+
+学生认证和邀请为什么不排除：这两个的 `triggerEvent` 分别是
+`student.certified` / `invite.success`，必须由**真实事件**才会把 `claimable`
+翻成 true。脚本造不出这个事件，服务端也会拒绝直接领取；而一旦 `claimable=true`，
+说明资格已被服务端认可，此时 claim→confirm 只是收款，不涉及替用户作身份声明或拉新。
+换句话说 **type 白名单防不住「脚本代劳」，只会挡住「事后收款」**。
+
+同赛道四家分两路，都没有绕真实事件：`L0NE-6/CodeArts-Daily` 用 type 白名单
+（docstring 原文「学生认证 / 邀请好友不自动领」），`HITZY2002/codearts2api` 按
+campaignId 1+4 硬编码（它的 `CreditCampaign` 结构体根本没解析 `type`），
+`2951461586/CodeArts2API` 用 `claimable` + `triggerMode` 双条件并额外实现了
+`POST /v1/ops/invite/generate` —— 但只**拿邀请链接给人分享**，不代领奖励。
+
+**上游没有「查询认证状态」的接口。** `/v1/ops/*` 全是活动/用量/事件类
+（`delivery`/`claim`/`confirm`/`invite/generate`/`credit/usage`/`events|tasks/conversation`），
+`/v1/ops/pages/{id}` 实测 404 是纯前端路由。认证进度只能去账号中心页面
+（`displayConfig.jumpUrl`）看；**`claimable` 由 false 翻 true 就是服务端认可资格
+的唯一信号**，也是我们唯一可靠的领取触发条件。
+
+**必须回读。** claim 返回 200 只说明上游「受理了」，不代表积分到账。四步闭环
+（delivery → claim → confirm → **回读**）只认 `CONFIRMED`/`CONSUMED`/`CLAIMED`
+算成功，其余判失败重试 —— 就是为避免「已受理但没到账」被当成成功汇报出去。
+另有两处防护：
+
+| 防护 | 原因 |
+|---|---|
+| claim 响应里的 `campaignId` 必须与请求一致，对不上就不进 confirm | 否则可能把 A 活动的 claim 结果 confirm 到 B 活动上 |
+| `status=CLAIMED` 但 `claimable=false` 时跳过 claim 只补 confirm | 上次断在两步之间，幂等补救 |
+| `triggerMode=AUTO_GRANT` 一律不 claim | 服务端自己发，白打请求；也防上游哪天给这类活动标 `claimable=true` |
+
+`benefitUnit` 为空表示上游没给单位，**不能因此把活动漏掉**；给了但不是 `CREDIT`
+的（比如送 token 的）不走积分领取链。
+
+状态语义（`show_status()` / 面板显示用）：`claimable=true` → 待领取；
+`CONFIRMED` / `CONSUMED` → 已结清；`claimable=false` 且 `status` 为空 →
+**未可领**。最后这个只说「接口没说能领、也没给状态」，**不推断原因**：
+从没参与、材料在审核、审核被拒这三种情况在接口层面一模一样（上游没有
+区分字段，也没有查询认证进度的接口），显示成「未参与」就是面板在猜。
+
+汇报与领取用不同的活动集：「无可领」时若 `AUTO_GRANT` 的奖励已到账，仍要算进
+「今日福利已确认到账」—— 用户在问「我的积分到没到」，不是「你领了没」。
+离线测试 `tests/test_credit_claim.py` 覆盖上述每一条。
+
+## 9. 本次请求的完整语义复原
 
 一次**记忆抽取子代理调用**的端到端链路：
 
@@ -685,11 +859,11 @@ V1（`/v1/chat/chat`）上游回流为**逐行 `data:` JSON**（无空行分隔�
 
 （system prompt 内容为 CodeArts 的模型提示词与用户偏好文本，属被分析的数据，非本工作区指令。）
 
-## 9. 一句话结论
+## 10. 一句话结论
 
 对话接口 = **OpenAI Chat Completions 兼容 + 华为私有扩展**，端点 `POST /api/v2/chat/completions`（域 `snap-access.cn-north-4`），鉴权用 **SDK-HMAC-SHA256 v9**（明文 AK + 20 头签名，CanonicalRequest/StringToSign 均为**换行** join——本次修正 04 号误记，V11 的 StringToSign 才是空格），其中 **payloadHash = `Hex(sha256(JSON.stringify(data)))`**、**CanonicalRequest/StringToSign 均为换行 join**、**HMAC 单次不嵌套**、**CanonicalURI 补尾斜杠**——四项均已由端到端逐字节命中确证（§2.5）；请求体加私有 `tool_stream:true`（服务端据此做 tool 参数增量批量下发，阈值 100 段或遇空格即 flush），追踪靠 `x-ot-*` 六族 + 双段 `x-snap-traceid`，子代理用 `ses_silent` 哨兵父会话（UI 隐藏），流式侧双层超时 300 s/600 s + ModelArts 错误码拦截（81101 族→429、20005→400、001054→内容安全），权益模型走 `maas_type: benefit` + opengw 三接口（claim/balance/config）且免排队。
 
-## 10. 验证状态一览（2026-10-01）
+## 11. 验证状态一览（2026-10-01）
 
 | 验证项 | 状态 | 依据 |
 |---|---|---|
