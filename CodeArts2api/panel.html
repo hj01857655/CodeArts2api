@@ -43,8 +43,9 @@ button:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-r
 .btn.primary{background:linear-gradient(135deg,var(--accent),color-mix(in srgb,var(--accent) 78%,#fff));border-color:transparent;color:#fff;font-weight:700;box-shadow:0 4px 16px color-mix(in srgb,var(--accent) 32%,transparent)}
 .btn.primary:hover{filter:brightness(1.05);box-shadow:0 6px 20px color-mix(in srgb,var(--accent) 42%,transparent)}
 .btn.ghost{background:transparent;box-shadow:none}
-.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:18px}
-@media (max-width:900px){.grid{grid-template-columns:1fr}}
+.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:18px}
+@media (max-width:1080px){.grid{grid-template-columns:repeat(2,1fr)}}
+@media (max-width:560px){.grid{grid-template-columns:1fr}}
 .stat{position:relative;overflow:hidden;background:var(--card);border:1px solid rgba(255,255,255,.8);border-radius:var(--radius);padding:15px 16px 13px;box-shadow:var(--shadow);backdrop-filter:blur(var(--blur));-webkit-backdrop-filter:blur(var(--blur))}
 .stat::before{content:"";position:absolute;inset:0 auto 0 0;width:4px;background:linear-gradient(180deg,var(--accent),transparent);border-radius:4px}
 .stat .k{color:var(--muted);font-size:12px;font-weight:600}
@@ -57,7 +58,7 @@ button:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-r
 .kv{display:flex;justify-content:space-between;align-items:center;padding:7px 0;border-bottom:1px solid rgba(100,116,139,.15)}
 .kv:last-child{border-bottom:none}
 .kv .k{color:var(--muted);font-size:13px}
-.kv .v{font-weight:600;font-variant-numeric:tabular-nums}
+.kv .v{font-weight:600;font-variant-numeric:tabular-nums;display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}
 .badge{display:inline-flex;align-items:center;gap:6px;padding:3px 9px;border-radius:999px;font-size:11px;font-weight:700;border:1px solid transparent}
 .badge::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}
 .badge.ok{background:rgba(22,163,74,.12);color:#15803d;border-color:rgba(22,163,74,.3)}
@@ -107,6 +108,11 @@ button:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-r
       <div class="sub" id="sBalanceDetail"></div>
     </div>
     <div class="stat">
+      <div class="k">积分余额</div>
+      <div class="v" id="sCredit">—</div>
+      <div class="sub" id="sCreditDetail"></div>
+    </div>
+    <div class="stat">
       <div class="k">可用模型</div>
       <div class="v" id="sModels">—</div>
       <div class="sub" id="sModelsDetail"></div>
@@ -132,6 +138,41 @@ button:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-r
       <div class="kv"><span class="k">已使用</span><span class="v" id="usedAmount">—</span></div>
       <div class="kv"><span class="k">剩余</span><span class="v" id="remainAmount">—</span></div>
       <div class="kv"><span class="k">自动签到</span><span class="v" id="autoCheckin">—</span></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-h"><h2>积分活动</h2><span class="muted" id="activityCount"></span></div>
+    <div class="card-b">
+      <div id="activityList"></div>
+      <p class="muted" id="activityNote" style="margin:10px 0 0;font-size:12px">
+        上游标记 <span class="mono">claimable</span> 就领，不按活动类型筛。学生认证（传证件）
+        和邀请好友（拉真人）要真实事件才会被标成可领——脚本造不出触发条件，资格认可后
+        这里自动收款。服务端自动发放（<span class="mono">AUTO_GRANT</span>）的活动不去
+        claim，等它自己到账。领取走 claim → confirm → 回读，只有回读到账才算成功。
+      </p>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-h"><h2>并发闸门</h2><span id="sessionBadge"></span></div>
+    <div class="card-b">
+      <div class="kv"><span class="k">在途 / 上限</span><span class="v" id="sessInUse">—</span></div>
+      <div class="kv"><span class="k">心跳</span><span class="v" id="sessHeartbeat">—</span></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-h"><h2>邀请好友</h2><span class="muted" id="inviteBadge"></span></div>
+    <div class="card-b">
+      <div class="kv"><span class="k">邀请码</span><span class="v mono" id="inviteCode">—</span></div>
+      <div class="kv"><span class="k">邀请链接</span><span class="v" id="inviteUrlWrap"><span class="mono" id="inviteUrl">—</span></span></div>
+      <div class="kv"><span class="k">已邀请</span><span class="v" id="inviteCount">—</span></div>
+      <p class="muted" id="inviteNote" style="margin:10px 0 0;font-size:12px">
+        只拿链接，不代领奖励。把链接发给好友、对方注册成功后奖励由服务端自动到账——
+        上游要求真实邀请事件（<span class="mono">invite.success</span>），脚本造不出这个条件，
+        直接领取也会被服务端拒绝。
+      </p>
     </div>
   </div>
 
@@ -214,6 +255,16 @@ function render(data){
   $("sBalance").textContent = total ? `${fmtNum(remain)}/${fmtNum(total)}` : "—";
   $("sBalanceDetail").textContent = total ? `${((remain/total)*100).toFixed(1)}% 剩余` : "";
 
+  const cRemain = benefit.credit_remain;
+  const cTotal = benefit.credit_total;
+  if (cRemain !== null && cRemain !== undefined && cTotal){
+    $("sCredit").textContent = `${fmtNum(cRemain)}/${fmtNum(cTotal)}`;
+    $("sCreditDetail").textContent = `${((cRemain/cTotal)*100).toFixed(1)}% 剩余`;
+  } else {
+    $("sCredit").textContent = "—";
+    $("sCreditDetail").textContent = "未获取到";
+  }
+
   $("sModels").textContent = models.length;
   const agentCount = models.filter(m => m.channel === "agent").length;
   const benefitCount = models.filter(m => m.channel === "benefit").length;
@@ -253,9 +304,102 @@ function render(data){
     ? models.map(m => `<span class="chip mono ${m.channel||""}">${escapeHtml(m.id)}</span>`).join("")
     : `<span class="muted">暂无模型</span>`;
 
+  renderActivities(benefit.credit_activities || []);
+  renderInvite(benefit.invite || null);
+  renderSession(data.session || {});
+
   // 底部
   $("baseUrl").textContent = location.origin + "/v1";
   $("subTitle").textContent = "凭证 · 福利 · 模型";
+}
+
+function renderSession(s){
+  const enabled = !!s.enabled;
+  // in_use 是 {闸门 key: 在途数}，不是总数——多账号时每把钥匙一路。
+  const lanes = s.in_use && typeof s.in_use === "object" ? Object.values(s.in_use) : [];
+  const inUse = lanes.reduce((a, b) => a + (b || 0), 0);
+  const limit = s.limit ?? 0;
+  $("sessInUse").textContent = `${inUse} / ${limit}`;
+  $("sessInUse").className = "v" + (inUse >= limit ? "" : " muted");
+  if (s.heartbeat){
+    $("sessHeartbeat").textContent = `开（${s.interval ?? "?"}s 续期）`;
+    $("sessHeartbeat").className = "v";
+  } else {
+    $("sessHeartbeat").textContent = "关（仅发 user-session-id）";
+    $("sessHeartbeat").className = "v muted";
+  }
+  if (!enabled){
+    $("sessionBadge").innerHTML = '<span class="badge warn">本地准入已关</span>';
+  } else if (inUse >= limit){
+    $("sessionBadge").innerHTML = '<span class="badge bad">满员（新请求回 409）</span>';
+  } else if (inUse > 0){
+    $("sessionBadge").innerHTML = '<span class="badge info">有在途</span>';
+  } else {
+    $("sessionBadge").innerHTML = '<span class="badge ok">空闲</span>';
+  }
+}
+
+// 活动状态 → 徽标配色。待领取用 info（不是 bad——那不是错误，
+// 只是今天还没到点或还没手动点签到）；已结清用 ok；未可领是中性的
+// （接口没说能领也没给状态，不推断原因）。
+function stateBadge(v){
+  let cls;
+  if (v.claimable) cls = "info";
+  else if (v.state === "已结清") cls = "ok";
+  else if (v.state === "未可领") cls = "info";
+  else cls = "warn";
+  return `<span class="badge ${cls}">${escapeHtml(v.state)}</span>`;
+}
+
+function renderActivities(list){
+  $("activityCount").textContent = list.length ? list.length + " 个" : "";
+  if (!list.length){
+    $("activityList").innerHTML = `<span class="muted">未获取到积分活动</span>`;
+    return;
+  }
+  $("activityList").innerHTML = list.map(v => `
+    <div class="kv">
+      <span class="k">${escapeHtml(v.title)}${v.manual ? ' <span class="muted" style="font-size:11px">需真实事件</span>' : ""}</span>
+      <span class="v">${v.amount === null || v.amount === undefined ? "—" : fmtNum(v.amount) + " 积分"} ${stateBadge(v)}</span>
+    </div>`).join("");
+}
+
+// 邀请卡片。上游把 inviteUrl / inviteCode 直接给字符串，激活数是数字；
+// 链接做成 <a> 让人能点开，旁边给个复制按钮——分享链接是这功能唯一的用途。
+function renderInvite(inv){
+  if (!inv || (!inv.inviteUrl && !inv.inviteCode)){
+    $("inviteBadge").innerHTML = '<span class="badge warn">未获取到</span>';
+    $("inviteCode").textContent = "—";
+    $("inviteUrl").textContent = "—";
+    $("inviteCount").textContent = "—";
+    $("inviteNote").textContent = inv && inv.error
+      ? "查询失败：" + inv.error
+      : "未获取到邀请链接（该活动可能已结束或当前账号不满足条件）";
+    return;
+  }
+  $("inviteCode").textContent = inv.inviteCode || "—";
+  if (inv.inviteUrl){
+    $("inviteUrlWrap").innerHTML =
+      `<a class="mono" href="${escapeHtml(inv.inviteUrl)}" target="_blank" rel="noopener">${escapeHtml(inv.inviteUrl)}</a>`
+      + ` <button class="btn ghost" id="btnCopyInvite" style="padding:2px 8px;font-size:11px">复制</button>`;
+    $("btnCopyInvite").onclick = async () => {
+      try {
+        await navigator.clipboard.writeText(inv.inviteUrl);
+        toast("邀请链接已复制");
+      } catch { toast("复制失败，请手动选择链接", false); }
+    };
+  } else {
+    $("inviteUrlWrap").innerHTML = '<span class="mono">—</span>';
+  }
+  const used = inv.activationCount;
+  const max = inv.maxActivations;
+  $("inviteCount").textContent = (used === null || used === undefined) ? "—"
+    : `${fmtNum(used)} / ${max ? fmtNum(max) : "不限"} 人`;
+  if (inv.valid === false){
+    $("inviteBadge").innerHTML = '<span class="badge bad">已失效</span>';
+  } else {
+    $("inviteBadge").innerHTML = '<span class="badge ok">有效</span>';
+  }
 }
 
 async function loadOverview(){

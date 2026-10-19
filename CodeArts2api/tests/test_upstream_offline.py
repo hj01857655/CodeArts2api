@@ -72,13 +72,29 @@ class FakeResp:
         pass
 
 
+class HeartbeatResp:
+    """并发闸门心跳的响应：{"status":"ok"} 才算登记成功。"""
+
+    status_code = 200
+
+    @staticmethod
+    def json():
+        return {"status": "ok"}
+
+
 class FakeUpstream:
-    """script 里放异常或 FakeResp；最后一项会一直重复。"""
+    """script 里放异常或 FakeResp；最后一项会一直重复。
+
+    心跳（PUT /snap-manager/.../heartbeat）与对话（POST /api/v2/chat/...）
+    分成两条队列：并发闸门默认开着，进来会先打一次 busy 心跳。混在一条
+    队列里，心跳会先消费掉 script 的首项，对话看到的就不是预期的那次失败了。
+    """
 
     def __init__(self, script):
         self.script = list(script)
         self.posts = []
         self.requests = []
+        self.heartbeats = []
 
     def _next(self):
         item = self.script.pop(0) if len(self.script) > 1 else self.script[0]
@@ -92,13 +108,17 @@ class FakeUpstream:
 
     def request(self, method, url, data=None, headers=None, timeout=None):
         self.requests.append({"method": method, "headers": dict(headers or {})})
+        if "heartbeat" in url:
+            self.heartbeats.append({"method": method, "url": url,
+                                    "headers": dict(headers or {})})
+            return HeartbeatResp()
         return self._next()
 
 
 sign_calls = []
 
 
-def fake_hmac_headers(body, benefit=False, model_id=""):
+def fake_hmac_headers(body, benefit=False, model_id="", session_id=""):
     sign_calls.append(model_id)
     return {"x-sdk-date": "20260101T000000Z-%d" % len(sign_calls),
             "Authorization": "SDK-HMAC-SHA256 stub"}

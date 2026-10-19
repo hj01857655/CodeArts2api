@@ -15,6 +15,7 @@ CodeArts 免费额度签到/查询工具
     python lanes/benefit.py status     # 只查询 tokens 签到状态，不领取
     python lanes/benefit.py claim      # 只领每日 1000 万福利 Token
     python lanes/benefit.py credit     # 只领每日 1000 积分 + 查积分余额
+    python lanes/benefit.py invite     # 拿邀请链接（不代领奖励）
     python lanes/benefit.py models     # 查询免费模型列表
 
 配合 Windows 计划任务可实现每日自动签到，例如每天 09:05 执行：
@@ -54,7 +55,6 @@ CONFIG_URL = OPENGW_BASE + "/api/v1/gateway/config"
 
 # 积分福利网关（每日签到领1000积分），与 opengw 不同源，AK/SK 签名即可调用
 SNAP_HOST = "snap-access.cn-north-4.myhuaweicloud.com"
-CREDIT_CAMPAIGN_ID = 1  # 「每日签到领1000 积分」活动 ID
 
 
 def signed_request(method: str, url: str, body: bytes = b"",
@@ -146,11 +146,58 @@ def snap_request(method: str, path: str, body: str = "", query: str = ""):
 
 
 def credit_activities() -> list:
-    """查询福利活动列表（含每日签到 campaignId=1 的 claimable 状态）。"""
+    """查询福利活动列表（原样返回 /v1/ops/delivery?channel=IDE 的 items）。"""
     code, data = snap_request("GET", "/v1/ops/delivery", query="channel=IDE")
     if code != 200:
         raise RuntimeError(f"查询福利活动失败 HTTP {code}: {str(data)[:300]}")
     return (data.get("data") or {}).get("items") or []
+
+
+def activity_view(item: dict) -> dict:
+    """把上游活动条目转成 CLI/面板共用的展示结构。
+
+    manual=True 表示这个活动要真实事件才推进（学生认证传证件、邀请拉真人），
+    面板上标出来让人知道该去哪操作——不是脚本漏领。
+
+    状态只描述**接口说出口的事**，不推断原因。`claimable=false` +
+    `status=null` 至少有三种情况：从没参与、材料在审核、审核被拒——
+    上游没有区分它们的字段，也没有「查询认证进度」的接口。所以这里只能写
+    「未可领」，不能写「未参与」（那是我们猜的，猜错就是面板骗人）。
+    """
+    if not isinstance(item, dict):
+        return {}
+    state = item.get("status") or ""
+    if item.get("claimable"):
+        todo = "待领取"
+    elif state in CREDIT_SETTLED:
+        todo = "已结清"
+    elif state:
+        todo = state
+    else:
+        # 上游既没说能领、也没给状态。别显示成「已结清」——那会让人误以为
+        # 积分到过账；也别显示成「未参与」——那需要认证进度，接口查不到。
+        todo = "未可领"
+    return {
+        "id": item.get("campaignId"),
+        "type": item.get("type") or "",
+        "title": item.get("title") or item.get("type") or "",
+        "amount": item.get("benefitAmount"),
+        # 要真实事件才推进的两类：脚本造不出触发条件，只能人去操作
+        "manual": item.get("type") in MANUAL_EVENT_TYPES,
+        "claimable": bool(item.get("claimable")),
+        "status": state,
+        "state": todo,
+        "trigger_mode": _trigger_mode(item),
+    }
+
+
+def credit_activity_views() -> list:
+    """活动列表的展示结构，按 campaignId 排序保证顺序稳定。
+
+    上游返回顺序不保证（实测是 3/4/2/1），面板和 CLI 都得排一下才不乱跳。
+    """
+    views = [v for v in (activity_view(i) for i in credit_activities()) if v]
+    return sorted(views, key=lambda v: v["id"] or 0)
 
 
 def credit_balance() -> dict:
@@ -174,25 +221,218 @@ def show_credit_balance() -> None:
         print("积分余额: 未获取到（可能尚未升级积分计费模式）")
 
 
-def do_credit_claim() -> None:
-    """领取「每日签到领1000 积分」：查 claimable → claim → confirm，幂等安全。"""
-    day = next((i for i in credit_activities() if i.get("campaignId") == CREDIT_CAMPAIGN_ID), None)
-    if not day:
-        print("积分签到: 未找到每日签到活动")
-        return
-    if not day.get("claimable"):
-        print(f"积分签到: 今日已领取或不可领取（status={day.get('status')}），跳过")
-        return
-    key = f"claim_{CREDIT_CAMPAIGN_ID}_{int(datetime.datetime.now().timestamp() * 1000)}"
-    body = json.dumps({"campaignId": CREDIT_CAMPAIGN_ID, "idempotentKey": key, "channel": "IDE"})
-    code, data = snap_request("POST", "/v1/ops/claim", body=body)
-    if code == 200 and data.get("code") == 0:
-        # 客户端同流程：claim 成功后需 confirm 确认到账
+# 可自动领取的活动类型。type 只用于**展示分组**（面板标「需人工」），
+# 不再作为领取门槛——见下方 _claimable_campaigns 的说明。
+KNOWN_TYPES = ("USER_LOGIN", "NEW_USER_REGISTER", "STUDENT_CERTIFIED", "INVITE_USER")
+# 要真实事件才推进的活动：脚本造不出触发条件，只能人去操作。
+#   STUDENT_CERTIFIED  triggerEvent=student.certified  上传证件等审核
+#   INVITE_USER        triggerEvent=invite.success      真人通过邀请链接注册
+# 注意这只是**展示标记**，不是领取门槛——资格一旦被服务端认可
+# （claimable 翻 true），领取动作和签到一样是纯收款。
+MANUAL_EVENT_TYPES = ("STUDENT_CERTIFIED", "INVITE_USER")
+# 已结清状态：CONFIRMED=已确认到账，CONSUMED=已确认且已用完。
+# 一次性奖励走到这两个状态就不必再查了（NEW_USER_REGISTER 只发一次）。
+CREDIT_SETTLED = ("CONFIRMED", "CONSUMED", "CLAIMED")
+CREDIT_CHANNEL = "IDE"
+# 邀请码生成端点。注意是 **POST-only**：GET 会回 `method GET not found` 404。
+INVITE_PATH = "/v1/ops/invite/generate"
+# 邀请活动的默认活动 ID。只作兜底——正常情况下从 delivery 列表里按
+# type=INVITE_USER 找，campaignId 是自增字段，会随活动上下线漂。
+INVITE_CAMPAIGN_ID = 3
+# 服务端自动发放的活动：不用也不该 claim。NEW_USER_REGISTER 实测就是
+# AUTO_GRANT——上游直接发到账，我们打一次 claim 只会白费一个请求。
+# 排除它还防另一头：上游哪天给 AUTO_GRANT 活动也标 claimable=true 时，
+# 我们会照旧不碰它，等它自己到账。
+AUTO_GRANT_MODE = "AUTO_GRANT"
+
+
+def _trigger_mode(item: dict) -> str:
+    return (item.get("extra") or {}).get("triggerMode") or ""
+
+
+def _claimable_campaigns(items: list) -> list:
+    """挑出「能领」或「领了没确认」的活动，按 campaignId 排序保证顺序稳定。
+
+    门槛只有一个：**上游说 claimable**。不按 type 白名单筛。
+
+    为什么不再排除学生认证/邀请：这两个活动的 triggerEvent 分别是
+    student.certified / invite.success，必须由真实事件（传证件审核通过、
+    真人通过邀请链接注册）才会把 claimable 翻成 true——脚本造不出这个事件，
+    服务端也会拒绝直接领取。而一旦 claimable=true，说明真实事件已经发生了，
+    此时 claim→confirm 只是收款，不涉及替用户作身份声明或拉新。
+    换句话说 type 白名单防不住「脚本代劳」，只会挡住「事后收款」。
+
+    上游没有「查询认证状态」的接口（/v1/ops/* 全是活动/用量/事件类），
+    认证进度只能去账号中心页面看；claimable 由 false 翻 true 就是
+    服务端认可资格的唯一信号。
+
+    真正要防的是 AUTO_GRANT：服务端自己会发的活动，我们不该去 claim。
+    """
+    out = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        # benefitUnit 空表示上游没给单位，别因此把活动漏掉；给了但不是 CREDIT
+        # 的（比如送 token 的）不走积分领取链。
+        unit = item.get("benefitUnit")
+        if unit and unit != "CREDIT":
+            continue
+        if not item.get("campaignId"):
+            continue
+        if _trigger_mode(item) == AUTO_GRANT_MODE:
+            continue
+        # claimable=还有得领；status=CLAIMED=领了但没 confirm（上次可能断在中间）
+        if item.get("claimable") or item.get("status") == "CLAIMED":
+            out.append(item)
+    return sorted(out, key=lambda i: i.get("campaignId") or 0)
+
+
+def _campaign_label(item: dict) -> str:
+    return "%s(#%s)" % (item.get("title") or item.get("type"),
+                        item.get("campaignId"))
+
+
+def do_credit_claim() -> str:
+    """领取可自动领取的积分活动：claim → confirm → **回读验证**。
+
+    返回一行中文汇报，供后台签到循环打印、也供面板展示。
+
+    为什么要回读：claim 返回 200 只说明上游「受理了」，不代表积分真到账。
+    L0NE-6/CodeArts-Daily 的四步闭环（delivery→claim→confirm→回读）就是为
+    了避免「已受理但没到账」——只认 CONFIRMED/CONSUMED 算成功，其余算失败重试。
+
+    另有两处防护：
+      · claim 响应里的 campaignId 必须与请求一致，对不上就不进 confirm
+        （否则可能把 A 活动的 claim 结果 confirm 到 B 活动上）；
+      · status=CLAIMED 但 claimable=False 时跳过 claim 只补 confirm
+        （上次断在两步之间，幂等补救）。
+    """
+    items = credit_activities()
+    todo = _claimable_campaigns(items)
+    if not todo:
+        # 无可领 ≠ 无事可报：AUTO_GRANT 的奖励服务端自己发，同样到账了，
+        # 汇报里要算上——用户在问「我的积分到没到」，不是「你领了没」。
+        settled = [i for i in items if (i.get("status") or "") in CREDIT_SETTLED]
+        if not settled:
+            return "当前没有可领取的积分活动"
+        return "今日福利已确认到账（%s）" % "、".join(
+            _campaign_label(i) for i in settled)
+
+    now_ms = int(datetime.datetime.now().timestamp() * 1000)
+    done, failed = [], []
+    for item in todo:
+        cid = item.get("campaignId")
+        label = _campaign_label(item)
+        need_claim = bool(item.get("claimable"))
+
+        if need_claim:
+            key = f"claim_{cid}_{now_ms}"
+            code, data = snap_request("POST", "/v1/ops/claim",
+                                      body=json.dumps({"campaignId": cid,
+                                                       "idempotentKey": key,
+                                                       "channel": CREDIT_CHANNEL}))
+            if code != 200 or data.get("code") != 0:
+                failed.append("%s 领取失败 HTTP %s %s" % (label, code, str(data)[:120]))
+                continue
+            returned = str(data.get("campaignId")) if isinstance(data, dict) else ""
+            if returned != str(cid):
+                failed.append("%s 领取响应活动 ID 不匹配（要 %s 回 %s），未确认"
+                              % (label, cid, returned or "空"))
+                continue
+
+        # claim 成功（或本来就只差 confirm）：确认到账
         ccode, cdata = snap_request("POST", "/v1/ops/confirm",
-                                    body=json.dumps({"campaignId": CREDIT_CAMPAIGN_ID}))
-        print(f"积分签到: 领取成功（confirm HTTP {ccode}）")
-    else:
-        print(f"积分签到: 领取失败 HTTP {code}: {str(data)[:300]}")
+                                    body=json.dumps({"campaignId": cid}))
+        if ccode != 200 or cdata.get("code") != 0:
+            failed.append("%s confirm 失败 HTTP %s %s" % (label, ccode, str(cdata)[:120]))
+            continue
+
+        # 回读验证：状态没变成 CONFIRMED/CONSUMED 就不算成功
+        after = next((i for i in credit_activities()
+                      if i.get("campaignId") == cid), None)
+        state = (after or {}).get("status") or ""
+        if state in CREDIT_SETTLED:
+            done.append("%s %s 积分" % (label, item.get("benefitAmount") or "?"))
+        else:
+            failed.append("%s confirm 后状态仍为 %s，未确认到账" % (label, state or "空"))
+
+    parts = []
+    if done:
+        parts.append("已领取 " + "、".join(done))
+    if failed:
+        parts.append("失败 " + "；".join(failed))
+    return "；".join(parts) if parts else "无可领取的积分活动"
+
+
+def invite_campaign_id(items: list = None) -> int:
+    """从活动列表里找邀请活动的 campaignId，找不到就退回硬编码值。
+
+    为什么不直接用常量：campaignId 是服务端自增字段，会随活动上下线漂
+    （邀请活动实测是 3，但 11-15 就结束了）。按 type=INVITE_USER 现找，
+    找到几个就取最小的那个（最早的、通常是主活动）。
+
+    参数 items 主要给测试用——生产路径传 None，函数自己去查。
+    """
+    if items is None:
+        items = credit_activities()
+    ids = sorted(i.get("campaignId") or 0 for i in items
+                 if isinstance(i, dict) and i.get("type") == "INVITE_USER"
+                 and i.get("campaignId"))
+    return ids[0] if ids else INVITE_CAMPAIGN_ID
+
+
+def generate_invite_code(campaign_id: int = None) -> dict:
+    """生成（或取回）邀请码与邀请链接。
+
+    这里**只拿链接**，绝不顺带 claim 邀请活动。邀请奖励必须由真实好友
+    通过链接完成注册才会产生——服务端对直接领取邀请活动会返回
+    「该活动类型需要先通过触发接口激活，无法直接领取」。造不出这个事件，
+    也不该替用户去拉新。
+
+    接口是幂等的「生成或取回」：同一个账号同一个活动反复调用返回同一条
+    邀请码，不会每次换新链接。
+    """
+    if campaign_id is None:
+        campaign_id = invite_campaign_id()
+    code, data = snap_request("POST", INVITE_PATH,
+                              body=json.dumps({"campaignId": campaign_id}))
+    if code != 200:
+        raise RuntimeError(f"生成邀请链接失败 HTTP {code}: {str(data)[:300]}")
+    # ops 族的信封是 code=0 表示成功；上游偶尔 HTTP 200 但 code 非 0
+    if isinstance(data, dict) and data.get("code") not in (None, 0):
+        raise RuntimeError(f"生成邀请链接失败 {data.get('code')}: "
+                           f"{data.get('message') or str(data)[:200]}")
+    payload = (data or {}).get("data")
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"邀请链接响应缺少 data: {str(data)[:300]}")
+    return payload
+
+
+def show_invite(campaign_id: int = None) -> None:
+    """打印邀请码与链接，并说明为什么脚本不代领奖励。"""
+    info = generate_invite_code(campaign_id)
+    url = info.get("inviteUrl") or info.get("invite_url") or ""
+    code = info.get("inviteCode") or info.get("invite_code") or ""
+    if not url and not code:
+        print("邀请链接: 未获取到（上游没返回 inviteCode / inviteUrl）")
+        return
+    cid = info.get("campaignId") if info.get("campaignId") is not None else campaign_id
+    print(f"邀请活动: #{cid}")
+    if code:
+        print(f"邀请码: {code}")
+    if url:
+        print(f"邀请链接: {url}")
+    used = info.get("activationCount")
+    limit = info.get("maxActivations")
+    if used is not None or limit is not None:
+        print(f"已邀请: {used if used is not None else '?'} / "
+              f"{limit if limit is not None else '?'} 人")
+    valid = info.get("valid")
+    if valid is False:
+        print("注意: 上游标记该邀请码已失效（valid=false）")
+    # 边界说清楚：链接发出去就行，奖励等服务端自己发
+    print("说明: 把链接发给好友注册即可，奖励由服务端在好友注册成功后自动到账；"
+          "脚本不代领邀请奖励（上游要求真实邀请事件）。")
 
 
 def models() -> list:
@@ -246,15 +486,25 @@ def show_status() -> None:
         print(f"每日额度: 查询失败 {str(error)[:120]}")
 
     try:
-        day = next((i for i in credit_activities() if i.get("campaignId") == CREDIT_CAMPAIGN_ID), None)
-        if day is None:
-            print("积分签到: 未找到每日签到活动")
-        else:
-            state = day.get("status") or "?"
-            print(f"积分签到: status={state} claimable={day.get('claimable')}"
-                  f" → {'今日已领' if state in ('CLAIMED', 'CONFIRMED', 'CONSUMED') else '今日可领'}")
+        # 逐条列出所有活动。要真实事件的两类（学生认证/邀请好友）单独一行，
+        # 标出该去哪操作——不是脚本漏领，是资格还没被服务端认可。
+        views = credit_activity_views()
+        plain = [v for v in views if not v["manual"]]
+        if not plain:
+            print("积分活动: 未找到活动")
+        for v in plain:
+            print("积分活动: %s(#%s) %s 积分 → %s" % (
+                v["title"], v["id"], v["amount"] if v["amount"] is not None else "?",
+                v["state"]))
+        manual = [v for v in views if v["manual"]]
+        if manual:
+            print("需真实事件（资格认可后自动领）: " + "、".join(
+                "%s %s 积分→%s" % (v["title"],
+                                   v["amount"] if v["amount"] is not None else "?",
+                                   v["state"])
+                for v in manual))
     except Exception as error:
-        print(f"积分签到: 查询失败 {str(error)[:120]}")
+        print(f"积分活动: 查询失败 {str(error)[:120]}")
 
 
 def do_claim() -> None:
@@ -283,8 +533,14 @@ def main(argv: list) -> int:
             do_claim()
             show_balance()
         elif action == "credit":
-            do_credit_claim()
+            print(do_credit_claim())
             show_credit_balance()
+        elif action == "invite":
+            # 可选传活动 ID：invite 3。默认从列表里现找，找不到用常量兜底
+            if len(argv) > 2 and argv[2].isdigit():
+                show_invite(int(argv[2]))
+            else:
+                show_invite()
         elif action == "models":
             print("免费模型列表:")
             show_models()
@@ -293,7 +549,7 @@ def main(argv: list) -> int:
             show_status()
             do_claim()
             show_balance()
-            do_credit_claim()
+            print(do_credit_claim())
             show_credit_balance()
     except RuntimeError as error:
         print(f"失败: {error}")

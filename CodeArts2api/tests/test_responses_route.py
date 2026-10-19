@@ -62,7 +62,8 @@ def install_fake(make_upstream):
     server._upstream.post = (
         lambda url, data=None, headers=None, stream=None, timeout=None:
         make_upstream(data))
-    server._hmac_headers = lambda body, benefit=False, model_id="": {}
+    server._hmac_headers = (
+        lambda body, benefit=False, model_id="", session_id="": {})
     server._refresh_models_if_needed = lambda: None
     server._force_sync_models_for = lambda m: True
     server.SUPPORTED_MODELS = ["test-model"]

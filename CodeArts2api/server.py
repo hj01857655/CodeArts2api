@@ -6,19 +6,21 @@ CodeArts OpenAI 兼容代理
 Chat Completions API，供 Claude Code / OpenCode / Cline / Cherry Studio
 等任何支持自定义 OpenAI Base URL 的工具直接使用。
 
-分包结构（协议层 / 通道层 / 翻译层分离）：
+分包结构（协议层 / 通道层 / 翻译层 / 面板层分离）：
   routes/chat.py           /v1/chat/completions
   routes/responses.py      /v1/responses（经 adapters/responses.py 翻译）
   routes/anthropic.py      /v1/messages（经 adapters/anthropic.py 翻译）
   adapters/responses.py    Responses ⇄ Chat 翻译桥（去 _bridge 后缀）
   adapters/anthropic.py    Anthropic Messages ⇄ Chat 翻译桥
+  admin/panel.py           面板页 + /admin/api/*（overview/checkin/reload-models）
+  admin/checkin.py         后台每日自动签到线程
   lanes/benefit.py         免费额度通道（签到/余额/免费模型同步）
   lanes/credential_provider.py  凭证装载与自动续期
   lanes/oauth.py           OAuth2 PKCE 浏览器登录（独立入口：python lanes/oauth.py）
   tests/                   离线测试（打桩 _upstream / _hmac_headers，不连真实上游）
 
 server.py 只留公共设施：签名、上游发送与重试、模型同步、dumps 抓包、
-请求日志、管理面板与路由挂载。路由体一律经 register(app, core) 的 core
+请求日志与路由挂载。路由体一律经 register(app, core) 的 core
 （即本模块）动态查找引擎函数，测试对 server 上这些名字的打桩因此对
 路由层同样生效。
 
@@ -46,7 +48,8 @@ from flask import Flask, Response, g, jsonify, request
 from requests.adapters import HTTPAdapter
 
 from adapters import anthropic, responses as responses_adapter
-from lanes import benefit, credential_provider, oauth  # noqa: F401  (oauth 仅登录时用)
+from admin import checkin as checkin_loop, panel as admin_route
+from lanes import benefit, credential_provider, oauth, session  # noqa: F401  (oauth 仅登录时用)
 from routes import anthropic as anthropic_route
 from routes import chat as chat_route
 from routes import responses as responses_route
@@ -92,6 +95,12 @@ UPSTREAM_CREDIT_CODES = {"TM.00001050"}
 # 这次重发收在代理里，省掉一次客户端往返和一整轮 502。
 CONN_RETRY_MAX = int(os.getenv("CODEARTS_CONN_RETRY_MAX", "2"))
 CONN_RETRY_BACKOFF = float(os.getenv("CODEARTS_CONN_RETRY_BACKOFF", "0.5"))
+# 上游并发闸门（每账号 3 路，满时报 TM.00001041）。闸门只认 heartbeat
+# busy/idle，不认「请求结束」——不发心跳则每个请求占一个槽永不归还。
+# 详见 lanes/session.py 的模块 docstring。
+SESSION_GATE_LIMIT = session.SESSION_LIMIT
+SESSION_GATE_ENABLED = os.getenv("CODEARTS_SESSION_GATE", "1").strip() not in (
+    "0", "false", "False", "no", "")
 # 上游 InferHub 对 max_tokens 有硬上限（实测 65536 通过、66560 起整请求被拒，
 # 报流内错误帧 InferHub.001001005.400 "The request param is invalid"）。
 # 而 AgentCenter/opengw 下发的 model_parameters.max_tokens 是上下文口径的值
@@ -341,11 +350,16 @@ def _signed_request(method: str, url: str, body: bytes = b"", extra_headers=None
             raise
 
 
-def _hmac_headers(body: bytes, benefit: bool = False, model_id: str = "") -> dict:
+def _hmac_headers(body: bytes, benefit: bool = False, model_id: str = "",
+                  session_id: str = "") -> dict:
     """构造华为云 SDK-HMAC-SHA256 签名请求头（仅适用于 POST /api/v2/chat/completions）。
 
     benefit=True 时按 IDE 免费模型通道附加 maas_type / model-id / model-name 三个头，
     这三个头必须参与签名，否则上游返回 "The model is not registered"。
+
+    session_id 非空时附带 user-session-id 头并参与签名：上游靠它把请求归到
+    我们已 busy 的那个会话上，槽位才会随 idle 归还。签名必须覆盖它，否则
+    改了头不重签，上游按签名里的 SignedHeaders 校验会发现头集合不匹配。
     """
     creds = _current_creds()
     now = datetime.datetime.now(datetime.timezone.utc)
@@ -363,6 +377,8 @@ def _hmac_headers(body: bytes, benefit: bool = False, model_id: str = "") -> dic
         headers["maas_type"] = "benefit"
         headers["model-id"] = model_id
         headers["model-name"] = model_id
+    if session_id:
+        headers["user-session-id"] = session_id
 
     signed_names = sorted(headers.keys())
     canonical_headers = "".join(f"{k}:{headers[k].strip()}\n" for k in signed_names)
@@ -928,22 +944,64 @@ def _sanitize_tool_calls(req_json: dict) -> None:
             len(msgs), len(out))
 
 
+def _session_account_id() -> str:
+    """取并发闸门的账号身份（跨 AK 轮换稳定）。取不到返回空串。
+
+    空串时所有请求挤同一个闸门口——比没有闸门好（仍能挡住并发），但跨账号
+    会互相挤。credential_provider 两条装载路径都会填这个字段。
+    """
+    creds = _current_creds()
+    return (creds.get("_account_id") or "").strip()
+
+
+def _gate_reject(slot):
+    """本地闸门满员：409（不是 429）。
+
+    429 会被客户端当成额度耗尽进入长冷却，而这个条件几十毫秒内就会自己
+    消失；409 的语义（冲突/稍后再试）才对得上。
+    """
+    logger.warning("[%s] [409] 本地并发闸门已满: %s（在途 %d/%d）",
+                   getattr(g, "rid", "?"), slot.denied,
+                   session.GATE.in_use(slot.key), SESSION_GATE_LIMIT)
+    return None, (
+        _cors(jsonify({"error": {
+            "message": ("上游并发已满（每账号 %d 路）：%s。请稍后重试，"
+                        "或调大 CODEARTS_SESSION_LIMIT" % (SESSION_GATE_LIMIT, slot.denied)),
+            "type": "rate_limit_error",
+            "code": "local_concurrency_limit",
+        }})),
+        session.GATE_STATUS,
+    )
+
+
 def _send_upstream(req_json: dict, model: str, benefit: bool):
     """签名并发给上游，含连接级/限流/凭证三类重试。
 
     chat 与 responses 两条路由共用。成功返回 (upstream, None)；
     最终失败返回 (None, (status, response))，response 已包好 CORS，
     调用方直接 return 即可。
+
+    并发闸门：进来先占一个槽并 busy 心跳，返回的 upstream 是
+    session.TrackedResponse——正文读完或连接关闭时才还槽并 idle。
+    之所以不在这里 finally：三条路由都在本函数返回**之后**才消费响应体
+    （流式尤其晚），提前还槽等于闸门只覆盖到「上游收下请求」那一刻。
     """
     # 重新序列化 body（确保与签名时一致）
     body = json.dumps(req_json, ensure_ascii=False).encode("utf-8")
+
+    slot = None
+    if SESSION_GATE_ENABLED:
+        slot = session.acquire(BASE_URL, _session_account_id(), logger=logger)
+        if not slot.ok:
+            return _gate_reject(slot)
 
     attempt = 0
     conn_attempt = 0
     auth_retry = False
     while True:
         # x-sdk-date 参与签名，每次重发都要重新签一遍，避免复用旧时间戳
-        headers = _hmac_headers(body, benefit=benefit, model_id=model)
+        headers = _hmac_headers(body, benefit=benefit, model_id=model,
+                                session_id=(slot.session_id if slot else ""))
         try:
             upstream = _upstream.post(
                 TARGET, data=body, headers=headers, stream=True, timeout=(10, 600)
@@ -958,10 +1016,13 @@ def _send_upstream(req_json: dict, model: str, benefit: bool):
                 time.sleep(delay)
                 continue
             logger.error("[%s] 上游请求异常: %s", g.rid, e)
+            if slot:
+                slot.release()
             return None, (_cors(jsonify({"error": {"message": f"upstream error: {e}"}})), 502)
 
         if upstream.status_code == 200:
-            return upstream, None
+            # 槽位活到响应体读完；TrackedResponse 收口 content/text/json/iter_lines/close
+            return (session.TrackedResponse(upstream, slot) if slot else upstream), None
 
         # 响应尚未开始，此处重试对客户端完全透明（流式同样适用）
         detail = ""
@@ -978,6 +1039,8 @@ def _send_upstream(req_json: dict, model: str, benefit: bool):
         # 积分耗尽：重试无意义，透传上游语义（402 避免客户端自动重试循环）
         if error_code in UPSTREAM_CREDIT_CODES:
             logger.warning("[%s] [402] 上游积分耗尽: %s %s", g.rid, error_code, error_msg)
+            if slot:
+                slot.release()
             return None, (_cors(jsonify({"error": {
                 "message": error_msg or "upstream credits exhausted",
                 "type": "insufficient_quota",
@@ -1010,6 +1073,8 @@ def _send_upstream(req_json: dict, model: str, benefit: bool):
 
         logger.error("[%s] [502] 上游返回非 200: status=%d body=%.500s",
                      g.rid, upstream.status_code, detail)
+        if slot:
+            slot.release()
         return None, (
             _cors(
                 jsonify(
@@ -1024,188 +1089,6 @@ def _send_upstream(req_json: dict, model: str, benefit: bool):
         )
 
 
-# ── 积分余额（snap-access 网关，agent 通道模型消耗）──────────────────────
-_credit_cache = {"at": 0.0, "data": None}
-
-
-def _credit_balance_cached(max_age: int = 60) -> dict:
-    """积分余额短缓存；面板刷新不必每次打上游。"""
-    now = time.time()
-    if _credit_cache["data"] is None or now - _credit_cache["at"] > max_age:
-        try:
-            _credit_cache["data"] = benefit.credit_balance()
-        except Exception as error:
-            logger.warning("积分余额查询失败: %s", error)
-            if _credit_cache["data"] is None:
-                _credit_cache["data"] = {}
-        _credit_cache["at"] = now
-    return _credit_cache["data"]
-
-
-# ── 管理面板 ──────────────────────────────────────────────────────────
-PANEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "panel.html")
-
-
-@app.route("/", methods=["GET"])
-@app.route("/admin", methods=["GET"])
-def serve_panel():
-    with open(PANEL_PATH, "r", encoding="utf-8") as f:
-        html = f.read()
-    # 将 key 注入面板页，前端 fetch 自动携带；面板仅监听本机，注入面不扩大暴露面
-    if API_KEY:
-        html = html.replace(
-            "</head>",
-            f"<script>window.__API_KEY__ = {json.dumps(API_KEY)};</script>\n</head>",
-            1,
-        )
-    return Response(html, content_type="text/html; charset=utf-8")
-
-
-@app.route("/admin/api/overview", methods=["GET", "OPTIONS"])
-def admin_overview():
-    if request.method == "OPTIONS":
-        return _cors(Response(""))
-    creds = _current_creds()
-    notice = credential_provider.token_notice(creds)
-    expires_at = creds.get("expires_at") or ""
-    remain_text = "—"
-    valid = bool(creds.get("token"))
-    if expires_at and valid:
-        try:
-            exp = datetime.datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
-            remain = (exp - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
-            if remain > 0:
-                hours = int(remain // 3600)
-                mins = int((remain % 3600) // 60)
-                remain_text = f"{hours} 小时 {mins} 分钟"
-            else:
-                remain_text = "已过期"
-                valid = False
-        except ValueError:
-            pass
-    cred_info = {
-        "source": "auths 文件" if creds.get("_auth_file") else ("CodeArts IDE 会话" if valid else "未找到"),
-        "ak": creds.get("ak", ""),
-        "expires_at": expires_at,
-        "valid": valid,
-        "remain_text": remain_text,
-        "notice": notice or "正常",
-    }
-    _refresh_models_if_needed()
-    models = []
-    for mid in SUPPORTED_MODELS:
-        detail = MODEL_DETAILS.get(mid, {})
-        models.append({"id": mid, "channel": detail.get("channel", "agent"), "name": detail.get("name", mid)})
-    benefit_info = {}
-    try:
-        status = benefit.claim_status()
-        # create_time 为毫秒时间戳，直接透传（前端 new Date 按毫秒解析）
-        benefit_info["last_checkin"] = status.get("create_time") or None
-    except Exception:
-        benefit_info["last_checkin"] = None
-    try:
-        bal = benefit.balance()
-        benefit_info.update(bal)
-    except Exception:
-        pass
-    # 积分通道（snap-access 网关）与福利额度同属 benefit，一并返回
-    credits = _credit_balance_cached()
-    if credits:
-        benefit_info["credit_total"] = credits.get("total")
-        benefit_info["credit_used"] = credits.get("used")
-        benefit_info["credit_remain"] = credits.get("remain")
-    return jsonify({
-        "service": "CodeArts2api",
-        "credential": cred_info,
-        "models": models,
-        "benefit": benefit_info,
-        "schedule": {"auto_checkin": BENEFIT_AUTO_CLAIM},
-    })
-
-
-@app.route("/admin/api/checkin", methods=["POST", "OPTIONS"])
-def admin_checkin():
-    if request.method == "OPTIONS":
-        return _cors(Response(""))
-    try:
-        benefit.claim()
-        messages = []
-        bal = benefit.balance()
-        remain = bal.get("total_balance") or 0
-        total = bal.get("total_quota") or 0
-        messages.append(f"Token {remain:,}/{total:,}")
-        try:
-            credit_status = benefit.do_credit_claim()
-            _credit_cache["at"] = 0.0
-            credits = benefit.credit_balance()
-            if credits:
-                messages.append(f"积分 {credits.get('remain'):,}/{credits.get('total'):,}（{credit_status}）")
-        except Exception as credit_error:
-            logger.warning("积分领取失败（不影响 Token 签到）: %s", credit_error)
-        return jsonify({"ok": True, "message": "签到成功：" + "，".join(messages)})
-    except Exception as e:
-        return jsonify({"ok": False, "message": f"签到失败: {e}"}), 500
-
-
-@app.route("/admin/api/reload-models", methods=["POST", "OPTIONS"])
-def admin_reload_models():
-    if request.method == "OPTIONS":
-        return _cors(Response(""))
-    ok = _refresh_models()
-    return jsonify({"ok": ok, "message": f"已同步 {len(SUPPORTED_MODELS)} 个模型" if ok else "同步失败，使用缓存"})
-
-
-_last_checkin_date = None
-
-
-def _benefit_checkin_loop():
-    """后台每日自动签到领取限时福利（幂等），成功后打印余额。
-
-    启动即签到一次，之后每小时检查是否跨入新的一天；跨了就再签。
-    先查签到状态，当天已签则跳过；领取失败不标记日期，下一小时自动重试。
-    """
-    global _last_checkin_date
-    while True:
-        today = datetime.date.today()
-        if _last_checkin_date != today:
-            try:
-                # 先查签到状态，当天已签则跳过
-                try:
-                    status = benefit.claim_status()
-                    last_ms = status.get("create_time")
-                    if last_ms and datetime.datetime.fromtimestamp(last_ms / 1000).date() == today:
-                        _last_checkin_date = today
-                        print(f"[签到] {today} 当天已签到，跳过")
-                        time.sleep(3600)
-                        continue
-                except Exception:
-                    pass  # 查不到状态就继续尝试领取
-                before = time.time()
-                claim_result = benefit.claim()
-                _last_checkin_date = today
-                info = benefit.balance()
-                total = info.get("total_quota") or 0
-                remain = info.get("total_balance") or 0
-                claim_ms = (claim_result or {}).get("create_time")
-                # 积分通道（每日 1000 积分，agent 模型消耗）与福利同一条日志汇报，幂等安全
-                credit_text = ""
-                try:
-                    credit_status = benefit.do_credit_claim()
-                    _credit_cache["at"] = 0.0
-                    credits = benefit.credit_balance()
-                    if credits:
-                        credit_text = f"，积分 {credits.get('remain'):,}/{credits.get('total'):,}（{credit_status}）"
-                except Exception as credit_error:
-                    credit_text = f"，积分查询失败: {credit_error}"
-                if claim_ms and claim_ms / 1000 < before - 10:
-                    print(f"[签到] {today} 当天已签到，Token {remain:,}/{total:,}{credit_text}")
-                else:
-                    print(f"[签到] {today} 福利领取成功，Token {remain:,}/{total:,}{credit_text}")
-            except Exception as error:
-                print(f"[签到] {today} 限时福利领取失败: {error}")
-        time.sleep(3600)
-
-
 # ── 兼容旧引用（协议层与通道层已分包，旧平铺模块名不再可用）──────────────────
 # 旧代码/探针里 `import anthropic_bridge` / `import responses_bridge` 的写法
 # 已失效；这里以属性别名兜住 `server.anthropic_bridge` 一类的访问。
@@ -1213,7 +1096,7 @@ anthropic_bridge = anthropic
 responses_bridge = responses_adapter
 
 
-# ── 协议路由层挂载（routes/）：每协议一个文件，本文件只做调度 ──────────────────
+# ── 路由层挂载（routes/ 协议面 + admin/ 面板面）：本文件只做调度 ───────────────
 # register(app, core) 里 core 传本模块：路由经模块属性动态查找引擎函数
 # （_send_upstream / _clamp_max_tokens / _sanitize_tool_calls / SUPPORTED_MODELS 等），
 # 测试对 server 上这些名字的打桩替换因此对路由层同样生效。
@@ -1223,6 +1106,7 @@ _core = _sys.modules[__name__]
 chat_route.register(app, _core)
 responses_route.register(app, _core)
 anthropic_route.register(app, _core)
+admin_route.register(app, _core)
 
 
 if __name__ == "__main__":
@@ -1238,8 +1122,16 @@ if __name__ == "__main__":
     print(f"CodeArts OpenAI 兼容代理已启动: http://{LISTEN_HOST}:{LISTEN_PORT}")
     print(f"OpenAI Base URL: http://{LISTEN_HOST}:{LISTEN_PORT}/v1")
     print("鉴权:", f"已启用 API_KEY（Bearer）" if API_KEY else "未设置 API_KEY（无鉴权）")
+    if SESSION_GATE_ENABLED:
+        print(f"并发闸门: 本地准入 {SESSION_GATE_LIMIT} 路（满员回 409），"
+              f"heartbeat {'开' if session.HEARTBEAT_ON else '关'}"
+              f"/{session.HEARTBEAT_INTERVAL:g}s")
+    else:
+        print("并发闸门: 已关闭（CODEARTS_SESSION_GATE=0）")
     print("可用模型:", SUPPORTED_MODELS)
     print("按 Ctrl+C 停止")
     if BENEFIT_AUTO_CLAIM:
-        threading.Thread(target=_benefit_checkin_loop, daemon=True, name="benefit-checkin").start()
+        # 后台每日签到：admin/checkin.py 的 benefit_checkin_loop(core)
+        threading.Thread(target=checkin_loop.benefit_checkin_loop, args=(_core,),
+                         daemon=True, name="benefit-checkin").start()
     app.run(host=LISTEN_HOST, port=LISTEN_PORT, threaded=True)
