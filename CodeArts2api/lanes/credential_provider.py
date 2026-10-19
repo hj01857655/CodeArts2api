@@ -158,11 +158,22 @@ def _session_to_cred(session):
              or session.get("securityToken") or "").strip()
     if not (ak and sk and token):
         return None
+    # 并发闸门的身份串，必须是**跨 AK 轮换稳定**的账号 id。
+    # account.id 是登录账号主键，续期时不变（AK/secretKey/token 每次都换）；
+    # 拿 AK 顶会让「同一账号」每刷一次期就变成一个新闸门口，3 路上限被
+    # 悄悄重置，等于没限。domainId 次之（账号级，同一账号下各项目共用）。
+    account_id = ((session.get("account") or {}).get("id")
+                  or session.get("accountId")
+                  or session.get("domainId")
+                  or session.get("userId")
+                  or session.get("userName")
+                  or "")
     return {
         "ak": ak,
         "sk": sk,
         "token": token,
         "expires_at": session.get("expires_at") or "",
+        "_account_id": account_id,
     }
 
 
@@ -355,6 +366,11 @@ def _load_auth_files():
             "dpop_private_key": data.get("dpop_private_key") or {},
             "client_id": data.get("client_id") or _CLIENT_ID,
             "_auth_file": path,
+            # **并发闸门的 key 必须用这个，不能用 ak**：ak 每次续期都换，
+            # 拿它当身份会让「同一账号」每刷一次期就变成一个陌生的新闸门口，
+            # 3 路上限被悄悄重置，攒够并发后上游回 TM.00001041（HTTP 400）。
+            # 文件名是 oauth.py 登录时定的，与 AK 轮换无关。
+            "_account_id": os.path.splitext(name)[0],
         }
         if _needs_refresh(cred):
             refreshed = _refresh_auth_file(cred)
