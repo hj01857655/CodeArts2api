@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 verify_real.py —— 真正的端到端签名验证
-body: Reqable 抓包（完整未打码，50010 字节）
+body: Reqable 流量分析（完整未打码，50010 字节）
 签名头: req_chat_completions.txt（明文，同一次请求）
 """
 import json, hashlib, hmac, sys, io
@@ -59,7 +59,7 @@ def hm(key, msg):
     return hmac.new(key, msg.encode('utf-8'), hashlib.sha256).hexdigest()
 
 
-print(f"body 字节数 : {len(body_bytes)}  (抓包 Content-Length: 50010)")
+print(f"body 字节数 : {len(body_bytes)}  (流量分析 Content-Length: 50010)")
 print(f"AK          : {AK[:6]}****（从 HuaweiCloudSession.json 运行时读取）")
 print(f"真实 Signature: {REAL_SIG}\n")
 

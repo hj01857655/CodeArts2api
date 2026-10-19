@@ -2,7 +2,7 @@
 """
 CodeArts 免费额度签到/查询工具
 ==============================
-对应 IDE 里的免费模型福利机制（opengw.developer.huaweicloud.com，抓包确认）：
+对应 IDE 里的免费模型福利机制（opengw.developer.huaweicloud.com，流量分析确认）：
 
     GET  /api/v1/benefit/claim        签到状态（返回上次签到时间）
     POST /api/v1/benefit/claim        签到领取当日免费额度（空 body）

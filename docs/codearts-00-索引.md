@@ -1,15 +1,15 @@
-# CodeArts Agent 逆向文档索引
+# CodeArts Agent 接口协议分析文档索引
 
 > 目标：本机安装的华为云 CodeArts Agent Windows 客户端。
 > 安装位置：`C:\Program Files\CodeArts Agent\`（Inno Setup 安装，874MB）。
-> 本文档集记录 2026-10-01 会话的逆向成果。断言除注明"推断"外均为 A 级（直接对照本机文件验证）。
+> 本文档集记录 2026-10-01 工作会话的接口协议分析成果。断言除注明"推断"外均为 A 级（直接对照本机文件验证）。
 
 ## 文档清单
 
 | 编号 | 文档 | 内容 | 等级 |
 |---|---|---|---|
 | 01 | [应用架构与安装布局](codearts-01-应用架构与安装布局.md) | 身份/版本/目录布局/数据目录/扩展清单/更新链 | A |
-| 02 | [认证链与 OAuth2 协议](codearts-02-认证链与OAuth2协议.md) | IAM OAuth2（PKCE+DPoP）抓包+源码双证、AK/SK 换发、secretStorage 存储面、内核第二 OAuth 面 | A |
+| 02 | [认证链与 OAuth2 协议](codearts-02-认证链与OAuth2协议.md) | IAM OAuth2（PKCE+DPoP）流量分析+源码双证、AK/SK 换发、secretStorage 存储面、内核第二 OAuth 面 | A |
 | 03 | [Agent 内核：Bun 单文件与 IPC](codearts-03-Agent内核-Bun单文件与IPC.md) | 内核=opencode 系运行时（Bun 1.3.14 单文件）、部署形态（~/.codeartsdoer 多版本并存）、spawn/env 注入、serve 服务器与 ~40 路由 IPC 面、KERNEL_* 数据目录 | A |
 | 04 | [签名体系与业务 API 端点面](codearts-04-签名体系与业务API端点面.md) | 三签名器全还原（SDK-HMAC-SHA256 v9 / V11 HKDF 派生 / AWS4-V1）、AK/SK 注入面、snap-access 主域+熔断备份、Agent-Type 鉴权头族、x-auth-token 五分支、模型双协议端点 | A |
 | 05 | [运行时数据、wire 协议与工具链](codearts-05-运行时数据与wire协议与工具链.md) | KERNEL_DATA_DIR 实值（~/.codeartsdoer）、opencode.db 18 表 + part 六型实测、prompt 请求 schema/SSE 事件枚举/WS 线协议、bash 三模式+默认权限表+windows_sandbox、凭证双实体 v10+AES-256-GCM 解密实值 | A |
@@ -76,4 +76,4 @@ CodeArts/
 2. `vscode-codebot`（codearts-snap）扩展全解：views/命令/配置面 → 网络端点与鉴权头
 3. `huaweicloud.authentication` 登录流程（OAuth/设备码？token 存储对照 secretStorage.enc）
 4. `taskboard.db` schema 与 `User/chat_sessions` 落盘格式
-5. 运行时抓包：门户登录 + Agent 对话端点（对照 ZCode 的 mitm 方法论，tools/mitm/ 可复用）
+5. 运行时流量分析：门户登录 + Agent 对话端点（对照 ZCode 的 mitm 方法论，tools/mitm/ 可复用）

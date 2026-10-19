@@ -1,6 +1,6 @@
 # 参考克隆（自带 .git，不入本仓库）
 codearts-daily-claim/
 node_modules/
-# 抓包与密钥样本（含会话凭据，绝不入库）
+# 流量样本与密钥样本（含会话凭据，绝不入库）
 re/capture/
 *.har

@@ -21,7 +21,7 @@
 7. PayloadHash b = X-Sdk-Content-Sha256 头（若存在）
                        否则 JSON.stringify(body) 的 Hex(sha256)
                        否则 EMPTY_BODY_SHA256 = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-8. CanonicalRequest = [method, uri, query, headers, signedHeaders, payloadHash].join("\n")   ← 换行 join（源码 `.join(\`\n\`)`；2026-10-01 由 07 号抓包复核实测修正，此前误记为空格 join）
+8. CanonicalRequest = [method, uri, query, headers, signedHeaders, payloadHash].join("\n")   ← 换行 join（源码 `.join(\`\n\`)`；2026-10-01 由 07 号流量分析复核实测修正，此前误记为空格 join）
 9. hex8 = Hex(sha256(CanonicalRequest))
 10. StringToSign = [ "SDK-HMAC-SHA256", G, hex8 ].join("\n")   ← 同为换行 join（源码 `.join(\`\n\`)`）
 11. Signature    = Hex(HMAC-SHA256(sk, StringToSign))

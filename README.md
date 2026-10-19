@@ -1,6 +1,6 @@
-# CodeArts Agent 逆向与 OpenAI 兼容网关
+# CodeArts Agent 接口协议分析与 OpenAI 兼容网关
 
-华为云 CodeArts Agent 的逆向成果，以及免费额度 OpenAI 兼容代理（`CodeArts2api`，端口 **8787**）。
+华为云 CodeArts Agent 的接口协议分析成果，以及免费额度 OpenAI / Anthropic 兼容代理（`CodeArts2api`，端口 **8787**）。
 
 ## CodeArts2api 速览
 

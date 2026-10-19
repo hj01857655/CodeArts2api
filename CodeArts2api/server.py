@@ -19,7 +19,7 @@ Chat Completions API，供 Claude Code / OpenCode / Cline / Cherry Studio
   lanes/oauth.py           OAuth2 PKCE 浏览器登录（独立入口：python lanes/oauth.py）
   tests/                   离线测试（打桩 _upstream / _hmac_headers，不连真实上游）
 
-server.py 只留公共设施：签名、上游发送与重试、模型同步、dumps 抓包、
+server.py 只留公共设施：签名、上游发送与重试、模型同步、dumps 落盘、
 请求日志与路由挂载。路由体一律经 register(app, core) 的 core
 （即本模块）动态查找引擎函数，测试对 server 上这些名字的打桩因此对
 路由层同样生效。
@@ -59,7 +59,7 @@ load_dotenv()
 def _current_creds() -> dict:
     return credential_provider.cred_and_env()
 
-# CodeArts 目标端点（从抓包确认）
+# CodeArts 目标端点（从流量分析确认）
 BASE_URL = "https://snap-access.cn-north-4.myhuaweicloud.com"
 TARGET = BASE_URL + "/api/v2/chat/completions"
 HOST = "snap-access.cn-north-4.myhuaweicloud.com"
@@ -68,7 +68,7 @@ AGENT_DETAIL_PATH = "/v1/agent-center/agents/detail"
 
 # 自动同步失败时的兜底列表（仅老套餐模型，走 AgentCenter 通道）；正常启动会用云端返回的列表覆盖它
 FALLBACK_AGENT_MODELS = ["openpangu-2.0-pro", "openpangu-2.0-flash", "GLM-5.2"]
-# 免费模型兜底列表（IDE 抓包确认）：走 maas_type=benefit 通道，签名时必须额外携带
+# 免费模型兜底列表（IDE 流量分析确认）：走 maas_type=benefit 通道，签名时必须额外携带
 # maas_type / model-id / model-name 三个头，否则报 "model is not registered"；
 # 老套餐模型带上这些头反而会报 "unsupported model"，因此两条通道严格区分。
 BENEFIT_MODELS = [
@@ -77,7 +77,7 @@ BENEFIT_MODELS = [
     "deepseek-v4-flash-0731",
 ]
 FALLBACK_MODELS = FALLBACK_AGENT_MODELS + BENEFIT_MODELS
-# opengw 免费额度网关（IDE 抓包确认）：永久 AK/SK 即可访问，gateway/config 返回免费模型列表
+# opengw 免费额度网关（IDE 流量分析确认）：永久 AK/SK 即可访问，gateway/config 返回免费模型列表
 OPENGW_BASE = "https://opengw.developer.huaweicloud.com"
 OPENGW_CONFIG_URL = OPENGW_BASE + "/api/v1/gateway/config"
 # 模型同步时自动领取限时福利（幂等；不领取则福利模型调用必报 benefit not found）
@@ -442,7 +442,7 @@ def _save_model_cache(models) -> None:
 
 
 def _refresh_benefit_models() -> list:
-    """从 opengw 免费额度网关动态获取免费模型列表（IDE 抓包确认的接口）。
+    """从 opengw 免费额度网关动态获取免费模型列表（IDE 流量分析确认的接口）。
 
     返回模型详情列表；失败时返回空列表，由调用方回退到 BENEFIT_MODELS 兜底。
     """
@@ -486,7 +486,7 @@ def _refresh_models() -> bool:
     """从 CodeArts AgentCenter 获取当前账号可用模型（仅老套餐通道）。"""
     global SUPPORTED_MODELS, MODEL_DETAILS
     try:
-        # 与 CodeArts CLI 抓包一致：AgentCenter 接口需要这个路由头。
+        # 与 CodeArts CLI 流量分析一致：AgentCenter 接口需要这个路由头。
         response = _signed_request(
             "GET",
             AGENT_LIST_URL,

@@ -115,7 +115,7 @@ codearts/
 }
 ```
 
-信号：`skipTlsVerification: true`（默认关 TLS 校验——运行时抓包注意证书选择）、`isInitSandbox` + `work.autoApproval`（bash 默认不自动批准、sandboxCommand 默认批准）→ 命令审批/沙箱体系是后续重点；`petName: cola-dark`（桌面宠物，tray 面）。
+信号：`skipTlsVerification: true`（默认关 TLS 校验——运行时流量分析注意证书选择）、`isInitSandbox` + `work.autoApproval`（bash 默认不自动批准、sandboxCommand 默认批准）→ 命令审批/沙箱体系是后续重点；`petName: cola-dark`（桌面宠物，tray 面）。
 
 ### 5.2 %APPDATA%\codearts-agent\（VS Code 型用户数据）
 
@@ -150,6 +150,6 @@ codearts-agent/
 |---|---|---|
 | 43 号「开源版差异面」 | out/vs + product.json diff | 同方法：对社区 VS Code 26.9.x 做闭源符号/模块 diff |
 | 12 号「阿里云验证码」 | secretStorage.enc + 登录流程 | 登录态与凭证加密对照（DPAPI/AES） |
-| 08 号「聊天对话接口」 | codearts-snap 网络面 | mitm 抓包（tools/mitm/ 复用） |
+| 08 号「聊天对话接口」 | codearts-snap 网络面 | mitm 流量分析（tools/mitm/ 复用） |
 | 14 号「本地存储全 schema」 | taskboard.db + chat_sessions | sqlite dump + 逐表 schema |
 | 05 号「V4 请求签名」 | 请求签名/鉴权头 | 对照是否有签名门（3012 族类似物） |

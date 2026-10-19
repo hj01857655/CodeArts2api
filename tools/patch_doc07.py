@@ -43,11 +43,11 @@ payloadHash = Hex(sha256(body))
 >
 > **教训**：验证哈希必须用**外部真值**（真实签名的反向约束，或服务端返回值），不能用同源计算结果。`tools/analyze_samples.py` 同属此类无效脚本，已删除。
 
-**日志侧 body 不是「截断」，是 redaction 打码**：`JSON.parse` 在 char 669/3504 失败的原因是日志层把敏感子串替换为 `****`（`read tool` → `re****l`），并非长度不足。证据：`body_len` 记录值与实际字符串长度完全相等（14401/14401、60954/60954、45346/45346）。因此**日志 body 不可用于任何哈希复算**——好在本节已由 Reqable 抓包解决（§2.7）。
+**日志侧 body 不是「截断」，是 redaction 打码**：`JSON.parse` 在 char 669/3504 失败的原因是日志层把敏感子串替换为 `****`（`read tool` → `re****l`），并非长度不足。证据：`body_len` 记录值与实际字符串长度完全相等（14401/14401、60954/60954、45346/45346）。因此**日志 body 不可用于任何哈希复算**——好在本节已由 Reqable 流量分析解决（§2.7）。
 
 ### 2.5 端到端验证：**成功（2026-10-01 结清）**
 
-用同一次请求的「Reqable 完整 body」+「抓包明文签名头」+「解密出的 SK」，逐字节复算出与线上完全一致的 Signature。
+用同一次请求的「Reqable 完整 body」+「流量分析明文签名头」+「解密出的 SK」，逐字节复算出与线上完全一致的 Signature。
 
 ```bash
 cd CodeArts/tools && python verify_real.py
@@ -93,7 +93,7 @@ cd CodeArts/tools && python verify_real.py
 
 > `host` 在 `CanonicalRequest` 中出现两次（canonicalHeaders 内一次），这是华为云 SDK-HMAC-SHA256 系列的固有特征，非笔误。
 
-### 2.6 body 数据源：Reqable 抓包落盘
+### 2.6 body 数据源：Reqable 流量分析落盘
 
 内核日志的 `chat body` 打码后不可用于哈希复算，本节数据改由 **Reqable** 提供。
 
@@ -102,7 +102,7 @@ cd CodeArts/tools && python verify_real.py
 | 落盘目录 | `%APPDATA%\\Reqable\\capture\\` |
 | 文件命名 | `<微秒时间戳>-<序号>-<n>-req_raw-body.reqable` |
 | 本次样本 | `1790833292162351-170-2-req_raw-body.reqable` |
-| 字节数 | **50010**（与抓包 `Content-Length: 50010` 精确吻合） |
+| 字节数 | **50010**（与流量分析 `Content-Length: 50010` 精确吻合） |
 | 打码 | **无**，完整原始 body |
 
 body 结构（实测）：

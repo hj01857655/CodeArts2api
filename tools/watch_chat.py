@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-watch_chat.py —— 监听 Reqable 抓包目录，捕获 chat/completions 的请求与响应。
+watch_chat.py —— 监听 Reqable 流量分析目录，捕获 chat/completions 的请求与响应。
 
 用法:
   python watch_chat.py [监控秒数]     默认 240 秒
@@ -25,7 +25,7 @@ if not os.path.isdir(CAP):
 
 known = set(os.listdir(CAP))
 print(f'监听 {CAP}，窗口 {DURATION} 秒')
-print(f'基线 {len(known)} 个文件。请现在打开 Reqable 抓包 → 在 CodeArts 发一条消息。\n')
+print(f'基线 {len(known)} 个文件。请现在打开 Reqable 流量分析 → 在 CodeArts 发一条消息。\n')
 
 deadline = time.time() + DURATION
 hits = []

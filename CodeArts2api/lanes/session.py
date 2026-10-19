@@ -6,7 +6,7 @@ TM.00001041（HTTP 400）。这个闸门**不认「请求结束」**，只认
 
     PUT /snap-manager/v1/chat-session/heartbeat?status=busy|idle
 
-（IDE 抓包 + 参考实现 Agent2API/agent2api 的 session.rs 双向确认）。
+（IDE 流量分析 + 参考实现 Agent2API/agent2api 的 session.rs 双向确认）。
 
 我们以前既不发心跳、请求里也不带 user-session-id，于是每个请求都让上游
 **隐式开一个会话且永不注销**：3 个槽很快占满，之后一律 TM.00001041，

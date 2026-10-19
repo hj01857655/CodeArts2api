@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""从内核日志的 bus-publish 事件中提取抓包那次会话的完整 messages。
+"""从内核日志的 bus-publish 事件中提取流量分析那次会话的完整 messages。
 
 背景：body 的 messages[] 内容被拆散落盘为 message.part.updated 事件
 （text/reasoning/tool part 各一行，含完整原文）。本工具按消息顺序重组。

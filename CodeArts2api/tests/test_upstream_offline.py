@@ -261,7 +261,7 @@ server._current_creds = lambda: {"ak": "AKTEST", "sk": "SKTEST", "token": "TOKEN
 def reference_authorization(method, url, body, signed):
     """独立按 SDK-HMAC-SHA256 规范算一遍，作为 _signed_request 的对照。
 
-    规范串以 tools/verify_real.py 对真实抓包验证过的形式为准：
+    规范串以 tools/verify_real.py 对真实流量分析验证过的形式为准：
     CanonicalRequest = method \\n uri \\n query \\n canonicalHeaders \\n signedHeaders \\n payloadHash
     """
     parsed = urllib.parse.urlparse(url)

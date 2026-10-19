@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """决定性检查：内核日志里是否含 body 所需的 system prompt 与 tools schema。
 
-body 50010 字节的构成（据抓包）：
+body 50010 字节的构成（据流量分析）：
   - 标量字段（model/max_tokens/tool_stream/…）      ~200 B
   - messages[0].content = system prompt            ~13000 token 量级
   - messages[1].content = user 消息                 ~1.1k token
@@ -18,7 +18,7 @@ SID = 'ses_f0a048070ffe5i6tt63yopV9aI'
 c = open(LOG, encoding='utf-8', errors='replace').read()
 print(f'日志大小: {len(c):,} 字符\n')
 
-# 1) system prompt 特征串（抓包里 system message 的开头）
+# 1) system prompt 特征串（流量分析里 system message 的开头）
 sys_probes = [
     'You are CodeArts, a dedicated code agent',
     '# Tone and style',

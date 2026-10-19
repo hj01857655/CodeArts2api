@@ -3,7 +3,7 @@
 """CodeArts 对话接口签名复现/验证工具（SDK-HMAC-SHA256 v9）。
 
 用途：给定一份完整的原始 HTTP 请求（含完整 body），用已解密的 AK/SK 复算
-Authorization 头，与抓包中的 Signature 逐字节比对，判定协议细节。
+Authorization 头，与流量分析中的 Signature 逐字节比对，判定协议细节。
 
 关键歧义点（本工具同时实现两种变体）：
   华为云官方 SDK-HMAC-SHA256 v3 规范：CanonicalRequest 用 \\n 连接
@@ -54,7 +54,7 @@ def parse_request(path: str):
 
 
 def collect_signed_headers(req, signed_list: str):
-    """按抓包给出的 SignedHeaders 顺序取头值（华为要求按字典序小写签名）。"""
+    """按流量分析给出的 SignedHeaders 顺序取头值（华为要求按字典序小写签名）。"""
     hdrs = {}
     for name in signed_list.split(";"):
         name = name.strip()
@@ -159,7 +159,7 @@ def main():
     signed_list, expect_sig = m.group(1), m.group(2)
     body = req["body"]
     payload_hash = hashlib.sha256(body.encode("utf-8")).hexdigest() if body.strip() else EMPTY_SHA256
-    print(f"body 长度: {len(body)} 字节（抓包 Content-Length: {req['headers'].get('Content-Length')}）")
+    print(f"body 长度: {len(body)} 字节（流量分析 Content-Length: {req['headers'].get('Content-Length')}）")
     print(f"payloadHash: {payload_hash}\n")
 
     modes = ["space", "newline"] if args.join == "both" else [args.join]

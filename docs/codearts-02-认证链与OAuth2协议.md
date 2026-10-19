@@ -1,9 +1,9 @@
-# 02 认证链与 OAuth2 协议（A 级：抓包 + 源码双证）
+# 02 认证链与 OAuth2 协议（A 级：流量分析 + 源码双证）
 
 > 证据：`re/capture/req_oauth2_tokens.txt`（2026-09-30 17:55 UTC 实抓刷新请求）+ `huaweicloud.authentication/dist/plugin.js`（3.3MB）源码定位。
 > 解析产物：`re/capture/decoded/*.json`（三层 JWT 全展开）。
 
-## 1. 抓包请求解剖（POST /v1/oauth2/tokens）
+## 1. 流量分析请求解剖（POST /v1/oauth2/tokens）
 
 `Host: sts.cn-north-4.myhuaweicloud.com`，`User-Agent: axios/1.13.1`，`Connection: close`，body 为 `application/x-www-form-urlencoded`：
 
@@ -53,7 +53,7 @@ header: { alg: ES256, typ: "dpop+jwt",
           jwk: { kty: EC, crv: P-256, x: "84JbP-K1qztyDIwsSdbJB0IoXWHf_z8dU34TJAvAxyk", y: … } }
 payload: { htm: "POST",
            htu: "https://sts.cn-north-4.myhuaweicloud.com/v1/oauth2/tokens",
-           iat: 1790790913,          // 2026-09-30T17:55:13Z = 抓包时刻（每次请求现签）
+           iat: 1790790913,          // 2026-09-30T17:55:13Z = 流量分析时刻（每次请求现签）
            jti: "27c9dd74…" (64hex) }
 sig: 64 bytes (r||s)
 ```

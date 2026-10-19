@@ -55,7 +55,7 @@ Chat 是上游母语；Responses / Anthropic 均为「方言 ⇄ 母语」双向
 ## 项目结构
 
 ```
-server.py                公共设施：签名、上游发送与重试、模型同步、dumps 抓包、请求日志、路由挂载
+server.py                公共设施：签名、上游发送与重试、模型同步、dumps 落盘、请求日志、路由挂载
 routes/chat.py           /v1/chat/completions
 routes/responses.py      /v1/responses
 routes/anthropic.py      /v1/messages

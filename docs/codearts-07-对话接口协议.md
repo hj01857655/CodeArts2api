@@ -128,7 +128,7 @@ StringToSign = SDK-HMAC-SHA256\n20260917T134947Z\nd394b2ae28d98633006e878ee9161e
 ```bash
 cd CodeArts/tools
 python verify_from_mainlog.py     # GET 骨架端到端复算，5/5 命中
-python brute_sign_variants.py     # 256 种实现细节穷举（定位上述陷阱）
+python sign_variants_probe.py     # 256 种实现细节穷举（定位上述陷阱）
 python verify_real.py             # POST 对话面端到端复算，逐字节命中（§2.5）
 ```
 
@@ -194,7 +194,7 @@ service=chat-param-plugin
 |---|---|
 | 10-01 内核日志 | 记录了完整头集（5 条 `header-debug` + 5 条 `Infer traceId`），但 **`chat body` 命中 0 次** —— body 仅在 `DEBUG_CHAT_BODY=1` 或日志级 DEBUG 时打印（源码 `if (process.env.DEBUG_CHAT_BODY==="1" \|\| log.getLevel()==="DEBUG")`），当时未开启 |
 | 09-22 内核日志 | 有 59 条 `chat body`，已提取为 `sign_sample.json` 三份样本。①`header-debug` 按源码 filter 主动剔除 Authorization；②body 部分子串被打码为 `****`（**非长度截断**，详见 §2.7）→ **打码内容不可用于哈希复算** |
-| 搜索 `SignedHeaders=` 命中 95 处 | **全部假阳性** —— 是某 agent 会话读取 `codearts2api/docs/reverse-engineering.md` 时的工具输出内容（文档正文里的示例），非真实请求头 |
+| 搜索 `SignedHeaders=` 命中 95 处 | **全部假阳性** —— 是某 agent 会话读取 `codearts2api/docs/protocol-analysis.md` 时的工具输出内容（文档正文里的示例），非真实请求头 |
 | mitm 项目（`E:\VSCodeSpace\Kiro\mitm`） | `python/mitm_capture.py` 存在，但 `wire_dump/` 为空，无 10-01 落盘 |
 | 本工作区 capture | 仅本次归档的截断版（body 省略为 `{…}`） |
 
@@ -204,7 +204,7 @@ service=chat-param-plugin
 
 1. **手工重建 body** —— 不可行。system prompt 与 9 个 tools schema 任一字节差异都会让 sha256 完全不同，验证必然假阴性；且日志侧 `****` 打码片段无法还原。（本次已删除误建的重编文件。）
 2. **从 `AtomCode2api/` 找签名实现** —— 无关。那是 AtomCode 项目（Rust TUI + GitCode 域，签名 `atomcode-signing-v1` 闭源 overlay），与 CodeArts 无关。
-3. **拿 `codearts2api` 文档当独立验证** —— 那是另一项目 2026-08-03 的既有逆向记录（v26.7.0），本文已按「转引」标注，非本工作区实测。
+3. **拿 `codearts2api` 文档当独立验证** —— 那是另一项目 2026-08-03 的既有协议分析记录（v26.7.0），本文已按「转引」标注，非本工作区实测。
 
 **与 codearts2api 文档的两处冲突**（以本工作区实测为准）：
 
@@ -671,7 +671,7 @@ V1（`/v1/chat/chat`）上游回流为**逐行 `data:` JSON**（无空行分隔�
 
 上游对每个账号只放 **3 路并发对话**，放不下时报 `TM.00001041`（HTTP 400，
 文案「并发会话数已达上限(3个)」）。关键点：**这个闸门不认「请求结束」**，
-只认心跳的 busy/idle 两个状态。源码与抓包双向确认：
+只认心跳的 busy/idle 两个状态。源码与流量分析双向确认：
 
 ```
 PUT /snap-manager/v1/chat-session/heartbeat?status=busy|idle   → {"status":"ok"}
