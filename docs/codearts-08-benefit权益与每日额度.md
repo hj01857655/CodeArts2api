@@ -418,6 +418,25 @@ plugin-version;x-auth-token;x-language;x-sdk-date;x-security-token;x-snap-tracei
 | `4007` | 当前分组无权限使用该模型 |
 | `4291` | **配额不足或月度token限额已超，请提升配额或等待重置**（额度耗尽）|
 
+### 7.1 线上现状：opengw 权益渠道按账号下线（2026-10 起）
+
+`error_code 4000 / invalid channel, group not found` 在 2026-10 之后对本账号是**稳定状态**，
+不是偶发、也不是签名问题。判定依据：
+
+- `claim` / `balance` / `config` **三个接口同时**返回 4000——签名若错会是 `APIG.0301`；
+- 同一套 AK/SK 打 snap-access 的 `/v1/ops/*` 全部正常（能查到活动、能 claim）；
+- 官方 IDE 自身也有这个分支：`benefit-gateway-config` 的 `enabled=false` 时渠道就是没开通。
+
+社区多个独立实现（`Johhny-Xu/multi-agent-hub`、`TIUCSIB/magpie-codearts-auth`）在同期
+记录了同一现象，结论一致：**福利 Token 通道按账号下线，积分通道不受影响**。
+
+因此网关的处理是：opengw 失败降级为「渠道未开通，已跳过」，不再把整次签到判为失败；
+每日收益改由积分通道（`/v1/ops/delivery` → `claim` → `confirm`）承担。
+
+> 注意区分两种 4000：`claim` 的 4000 按本文件 §7 的定义是「参数错误 / JSON 解析失败」，
+> 而实际返回的 `error_msg` 是 `invalid channel, group not found`——它描述的是**渠道**问题，
+> 不是我们发错了参数。判断依据看 `error_msg`，不要只看码。
+
 ## 8. benefit 模型豁免排队
 
 非benefit 模型走并发排队（`startQueuePolling({task_id, model})` + 请求头 `is-need-queue: true`）。以下两类直接跳过：

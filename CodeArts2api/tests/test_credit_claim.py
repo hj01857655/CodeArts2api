@@ -69,14 +69,18 @@ class FakeSnap:
             self._reads += 1
             return 200, {"data": {"items": items}}
         if path == "/v1/ops/claim":
-            # 默认按请求里的 campaignId 回显（真实上游的行为）；
+            # 默认按请求里的 campaignId 回显（真实上游的行为）。真实信封是
+            # {"code":0,"message":"ok","data":{id,campaignId,...}}——活动记录在
+            # data 里，顶层没有 campaignId。测试必须照这个形状造，否则测不到
+            # 代码读错层级的问题。
             # 需要构造"回错 id"的场景时才用固定的 claim_result。
             if self.claim_result is None:
                 try:
                     cid = json.loads(body).get("campaignId")
                 except Exception:
                     cid = None
-                return 200, {"code": 0, "campaignId": cid}
+                return 200, {"code": 0, "message": "ok", "data": {
+                    "id": 700000 + (cid or 0), "campaignId": cid, "status": "CLAIMED"}}
             return self.claim_result
         if path == "/v1/ops/confirm":
             return self.confirm_result
@@ -132,10 +136,30 @@ check("claim 带 channel=IDE", all("IDE" in b for b in claimed))
 snap = FakeSnap([
     [campaign(1, "USER_LOGIN", claimable=True)],
     [campaign(1, "USER_LOGIN", claimable=True)],
-], claim_result=(200, {"code": 0, "campaignId": 99}))
+], claim_result=(200, {"code": 0, "message": "ok",
+                      "data": {"id": 701, "campaignId": 99}}))
 msg = run(snap)
 check("campaignId 不匹配时判失败", "不匹配" in msg, msg)
 check("campaignId 不匹配时不 confirm", snap.bodies("/v1/ops/confirm") == [])
+
+# ── 2b. 40001（权益未刷新/今日已领）→ 不判失败，仍补 confirm ──────────────
+# 这个响应没有 data，也没有 id。以前读顶层 campaignId 会拿到 None，
+# 把「今天已经领过」误判成「ID 不匹配」。
+snap = FakeSnap([
+    [campaign(1, "USER_LOGIN", claimable=True)],
+    [campaign(1, "USER_LOGIN", status="CONFIRMED")],
+], claim_result=(200, {"code": 40001, "message": "尚未到达权益刷新时间", "data": None}))
+msg = run(snap)
+check("40001 不判失败", "失败" not in msg, msg)
+check("40001 仍补 confirm", len(snap.bodies("/v1/ops/confirm")) == 1)
+
+# ── 2c. code=0 但 id 为空 → 不 confirm（没有待确认记录） ─────────────────
+snap = FakeSnap([
+    [campaign(1, "USER_LOGIN", claimable=True)],
+], claim_result=(200, {"code": 0, "message": "ok", "data": {"id": None, "campaignId": 1}}))
+msg = run(snap)
+check("id 为空时不 confirm", snap.bodies("/v1/ops/confirm") == [], msg)
+check("id 为空时如实报未确认", "未确认" in msg, msg)
 
 # ── 3. confirm 后回读状态没变 → 判失败 ─────────────────────────────────
 snap = FakeSnap([

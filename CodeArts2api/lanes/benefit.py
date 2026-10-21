@@ -331,13 +331,32 @@ def do_credit_claim() -> str:
                                       body=json.dumps({"campaignId": cid,
                                                        "idempotentKey": key,
                                                        "channel": CREDIT_CHANNEL}))
-            if code != 200 or data.get("code") != 0:
+            if code != 200:
                 failed.append("%s 领取失败 HTTP %s %s" % (label, code, str(data)[:120]))
                 continue
-            returned = str(data.get("campaignId")) if isinstance(data, dict) else ""
-            if returned != str(cid):
+            biz = data.get("code") if isinstance(data, dict) else None
+            if biz not in (0, 40001):
+                failed.append("%s 领取失败 code=%s %s"
+                              % (label, biz, str(data.get("message") or data)[:120]))
+                continue
+            # claim 的成功信封是 {"code":0,"message":"ok","data":{...}}——活动记录
+            # 在 data 里，不在顶层。读顶层 campaignId 会永远拿到 None，
+            # 于是每一次真实领取都被判成「ID 不匹配」，积分到账了却不 confirm。
+            payload = data.get("data")
+            payload = payload if isinstance(payload, dict) else {}
+            returned = payload.get("campaignId")
+            if returned is not None and str(returned) != str(cid):
                 failed.append("%s 领取响应活动 ID 不匹配（要 %s 回 %s），未确认"
-                              % (label, cid, returned or "空"))
+                              % (label, cid, returned))
+                continue
+            if biz == 40001:
+                # 40001 = 尚未到达权益刷新时间（今天已领）。这个响应没有 data，
+                # 自然也没有 id；它不代表失败，只代表这次 claim 没产生新记录。
+                # 后面 confirm 仍要发：上次可能断在 claim/confirm 之间。
+                pass
+            elif payload.get("id") is None:
+                # code=0 但 id 为空：上游受理了却没产生待确认记录，confirm 无对象。
+                failed.append("%s 领取未产生记录（响应 id 为空），未确认" % label)
                 continue
 
         # claim 成功（或本来就只差 confirm）：确认到账
