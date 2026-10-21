@@ -425,17 +425,37 @@ plugin-version;x-auth-token;x-language;x-sdk-date;x-security-token;x-snap-tracei
 
 - `claim` / `balance` / `config` **三个接口同时**返回 4000——签名若错会是 `APIG.0301`；
 - 同一套 AK/SK 打 snap-access 的 `/v1/ops/*` 全部正常（能查到活动、能 claim）；
-- 官方 IDE 自身也有这个分支：`benefit-gateway-config` 的 `enabled=false` 时渠道就是没开通。
+- **总开关明确返回 `enabled=false`**：`GET {snap}/v1/benefit-gateway-config` →
+  `{"enabled": false, "is_examination_domain": false, "examination_model_enable": false}`。
 
-社区多个独立实现（`Johhny-Xu/multi-agent-hub`、`TIUCSIB/magpie-codearts-auth`）在同期
-记录了同一现象，结论一致：**福利 Token 通道按账号下线，积分通道不受影响**。
+#### 判据要用总开关，不要解析错误文案
 
-因此网关的处理是：opengw 失败降级为「渠道未开通，已跳过」，不再把整次签到判为失败；
-每日收益改由积分通道（`/v1/ops/delivery` → `claim` → `confirm`）承担。
+`/v1/benefit-gateway-config` 是官方设计里的**福利网关总开关**：
+
+```
+GET https://snap-access.cn-north-4.myhuaweicloud.com/v1/benefit-gateway-config
+→ {"enabled": bool, ...}      ← 裸对象，没有 {code,data} 信封
+```
+
+⚠️ 它在 **snap-access** 域。同样的路径在 opengw 域是 `404 APIG.0101`（接口未发布）。
+
+主流实现（`aimod-cc/Agent2API`、`bluechonk/modelmux`、`HITZY2002/codearts2api`）都是
+**先问开关，`enabled=false` 就直接返回**，根本不去打 opengw 的 claim / config：
+
+```rust
+// aimod-cc/Agent2API: providers/codearts/models.rs
+if !parse_benefit_gate(&gate)? {
+    return Ok(None);        // 「这个部署没有福利网关」，不是错误
+}
+```
+
+网关照此实现：`_benefit_gateway_enabled()` 返回 false 时整体跳过，日志只报一次 INFO。
+开关查询本身失败（网络/签名）**不**视为关闭——那只是问不到，按原流程继续并如实报错，
+否则一次网络抖动就会把福利模型永久关掉。
 
 > 注意区分两种 4000：`claim` 的 4000 按本文件 §7 的定义是「参数错误 / JSON 解析失败」，
 > 而实际返回的 `error_msg` 是 `invalid channel, group not found`——它描述的是**渠道**问题，
-> 不是我们发错了参数。判断依据看 `error_msg`，不要只看码。
+> 不是我们发错了参数。判断依据看 `error_msg`，不要只看码；但更好的做法是**看总开关**。
 
 ## 8. benefit 模型豁免排队
 

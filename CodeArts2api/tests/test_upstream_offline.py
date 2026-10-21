@@ -392,6 +392,90 @@ check("T12 记为 client 断开", any("client 断开" in m for m in records),
       [m for m in records if "断开" in m][:1])
 check("T12 未误判为 stream 中断", not any("stream 中断" in m for m in records))
 
+
+# ── T13 福利网关总开关关掉时，不打 opengw 的 claim/config ──────────────────
+# 判据从「猜 error_msg 里的 invalid channel」变成「读 benefit-gateway-config.
+# enabled」。关掉就整体跳过：claim 与 config 一次都不该发出。
+print("\n=== T13 福利网关未开通时跳过 opengw ===")
+
+
+class FakeGate:
+    """记录调用；claim/config 一旦被调用就说明没有提前拦下。"""
+
+    def __init__(self, enabled):
+        self.enabled = enabled
+        self.calls = []
+
+    def __call__(self, method, url, **kwargs):
+        self.calls.append((method, url))
+        if url.endswith("/v1/benefit-gateway-config"):
+            return FakeGateResp({"enabled": self.enabled})
+        raise AssertionError("开关关闭时不该请求 %s" % url)
+
+
+class FakeGateResp:
+    status_code = 200
+
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self._payload
+
+
+def claim_calls(gate):
+    return [u for _, u in gate.calls if "benefit/claim" in u or "gateway/config" in u]
+
+
+original_signed, original_claim = server._signed_request, server.benefit.claim
+gate = FakeGate(enabled=False)
+server._signed_request = gate
+server.benefit.claim = lambda: (_ for _ in ()).throw(AssertionError("不该 claim"))
+server._benefit_channel_down = False
+server.BENEFIT_AUTO_CLAIM = True
+result = server._refresh_benefit_models()
+check("T13 开关关闭时返回空列表", result == [], result)
+check("T13 只查了一次总开关", len(gate.calls) == 1, gate.calls)
+check("T13 没有打 claim / gateway-config", claim_calls(gate) == [], claim_calls(gate))
+check("T13 记住渠道未开通", server._benefit_channel_down is True)
+
+# 再同步一次：连开关都不该再查（已缓存为未开通）
+gate.calls.clear()
+server._refresh_benefit_models()
+check("T13 第二次同步零请求", gate.calls == [], gate.calls)
+
+# 开关查询本身失败 = 问不到，不是「关闭」；应继续走原流程而不是永久关掉
+print("\n=== T14 开关查询失败不误判为渠道关闭 ===")
+server._benefit_channel_down = False
+
+
+class FlakyGate:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, method, url, **kwargs):
+        self.calls.append(url)
+        if url.endswith("/v1/benefit-gateway-config"):
+            raise requests.exceptions.ConnectionError("boom")
+        if "gateway/config" in url:
+            return FakeGateResp({"result": {"models": []}})
+        raise AssertionError("unexpected %s" % url)
+
+
+flaky = FlakyGate()
+server._signed_request = flaky
+claimed = []
+server.benefit.claim = lambda: claimed.append(1) or {}
+server._refresh_benefit_models()
+check("T14 开关查询失败时仍尝试 config", any("gateway/config" in u for u in flaky.calls),
+      flaky.calls)
+check("T14 开关查询失败时不标记渠道关闭", server._benefit_channel_down is False)
+
+server._signed_request, server.benefit.claim = original_signed, original_claim
+
 print("\n通过 %d / %d" % (len(passed), len(passed) + len(failed)))
 if failed:
     print("失败:", failed)

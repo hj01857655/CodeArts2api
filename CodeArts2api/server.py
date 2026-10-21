@@ -80,6 +80,11 @@ FALLBACK_MODELS = FALLBACK_AGENT_MODELS + BENEFIT_MODELS
 # opengw 免费额度网关（IDE 流量分析确认）：永久 AK/SK 即可访问，gateway/config 返回免费模型列表
 OPENGW_BASE = "https://opengw.developer.huaweicloud.com"
 OPENGW_CONFIG_URL = OPENGW_BASE + "/api/v1/gateway/config"
+# 福利网关总开关。注意它挂在 snap-access 域，不在 opengw 域（opengw 上该路径 404
+# APIG.0101）。返回裸对象 {"enabled": bool}，没有 {code,data} 信封。
+BENEFIT_GATEWAY_CONFIG_URL = (
+    BASE_URL + "/v1/benefit-gateway-config"
+)
 # 模型同步时自动领取限时福利（幂等；不领取则福利模型调用必报 benefit not found）
 BENEFIT_AUTO_CLAIM = os.getenv("CODEARTS_BENEFIT_AUTO_CLAIM", "1").strip() not in ("0", "false", "False", "no", "")
 # opengw 权益渠道是否已确认未开通。渠道按账号下线后，claim/config 会稳定返回
@@ -449,9 +454,38 @@ def _is_channel_down(error: BaseException) -> bool:
 
     上游把渠道问题也塞在 4000 码里，光看码会与「参数错误」混淆；判据只能是
     error_msg 里的渠道字样。签名错会是 APIG.0301，不会落到这里。
+
+    这是**兜底判据**：正常路径应当先问 `_benefit_gateway_enabled()`，
+    别靠解析错误文案来推断渠道状态。
     """
     message = str(error)
     return "invalid channel" in message or "group not found" in message
+
+
+def _benefit_gateway_enabled() -> bool:
+    """问上游：这个账号的福利网关开没开。
+
+    `GET /v1/benefit-gateway-config` → `{"enabled": bool, ...}`，是官方设计里的
+    总开关：未开通时 opengw 的 claim / config / balance 一律回
+    `4000 invalid channel, group not found`。所以先读开关，关了就不去撞那三个接口
+    ——判断依据从「猜 error_msg」变成「读上游的明确字段」。
+
+    查询本身失败（网络/签名）时返回 True：这只是「问不到」，不代表渠道关闭，
+    让后续流程按原样走并如实报错，不要因为一次网络抖动就把福利模型永久关掉。
+    """
+    try:
+        response = _signed_request(
+            "GET", BENEFIT_GATEWAY_CONFIG_URL,
+            extra_headers={"agent-type": "PromptCenter", "x-language": "zh-cn"},
+            timeout=15,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        # 这个接口返回**裸对象**（没有 {code,data} 信封），直接取 enabled
+        return bool(payload.get("enabled"))
+    except Exception as error:
+        logger.debug("查询福利网关总开关失败，按「未关闭」继续: %s", error)
+        return True
 
 
 def _refresh_benefit_models() -> list:
@@ -459,13 +493,18 @@ def _refresh_benefit_models() -> list:
 
     返回模型详情列表；失败时返回空列表，由调用方回退到 BENEFIT_MODELS 兜底。
 
-    注意 opengw 这条**权益渠道**自 2026-10 起对部分账号已下线，claim 与 config
-    会稳定返回 `4000 invalid channel, group not found`。这不是错误、也不值得
-    每次同步都重试——渠道没开通，重试一万次结果一样。首次遇到就用
-    `_benefit_channel_down` 记住，后续同步直接跳过，把日志从 WARNING 降到只报一次。
+    注意 opengw 这条**权益渠道**自 2026-10 起对部分账号已下线。先问总开关
+    （`/v1/benefit-gateway-config`），确认关闭就整体跳过——渠道没开通时
+    claim 与 config 都只会回 `4000 invalid channel, group not found`，白打两次
+    请求还刷两条误导性 WARNING。开关状态结果缓存在 `_benefit_channel_down`。
     """
     global _benefit_channel_down
     if _benefit_channel_down:
+        return []
+    if not _benefit_gateway_enabled():
+        _benefit_channel_down = True
+        logger.info("账号的福利网关未开通（benefit-gateway-config.enabled=false），"
+                    "跳过免费模型同步；模型列表由 AgentCenter 提供")
         return []
     # 先领取限时福利（幂等）：未领取时福利模型调用必报 InferHub.4004.200 benefit not found。
     # 领取失败只记日志，不阻断模型列表同步。
@@ -474,9 +513,10 @@ def _refresh_benefit_models() -> list:
             benefit.claim()
         except Exception as error:
             if _is_channel_down(error):
+                # 开关说开着、实际却回 invalid channel：以实际上游行为为准。
                 _benefit_channel_down = True
-                logger.info("opengw 权益渠道未开通（%s），本次跳过免费模型同步；"
-                            "模型列表由 AgentCenter 提供", error)
+                logger.info("福利网关开关为开，但上游回 invalid channel（%s），"
+                            "按未开通处理并跳过", error)
                 return []
             logger.warning("限时福利自动领取失败（不影响模型列表同步）: %s", error)
     try:
