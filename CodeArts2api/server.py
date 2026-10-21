@@ -82,6 +82,9 @@ OPENGW_BASE = "https://opengw.developer.huaweicloud.com"
 OPENGW_CONFIG_URL = OPENGW_BASE + "/api/v1/gateway/config"
 # 模型同步时自动领取限时福利（幂等；不领取则福利模型调用必报 benefit not found）
 BENEFIT_AUTO_CLAIM = os.getenv("CODEARTS_BENEFIT_AUTO_CLAIM", "1").strip() not in ("0", "false", "False", "no", "")
+# opengw 权益渠道是否已确认未开通。渠道按账号下线后，claim/config 会稳定返回
+# 4000 invalid channel——这是终态不是偶发，记住后就不再每轮同步重试。
+_benefit_channel_down = False
 # 上游业务错误码：并发限流可退避重试，积分耗尽不可重试直接透传语义
 UPSTREAM_RETRY_CODES = {"TM.00001041"}
 # STS 临时凭证过期（APIG.0602）与 AK 校验失败（APIG.0301）：
@@ -441,17 +444,40 @@ def _save_model_cache(models) -> None:
     os.replace(temp_path, MODEL_CACHE_PATH)
 
 
+def _is_channel_down(error: BaseException) -> bool:
+    """判断错误是不是「权益渠道未开通」，而不是网络/签名问题。
+
+    上游把渠道问题也塞在 4000 码里，光看码会与「参数错误」混淆；判据只能是
+    error_msg 里的渠道字样。签名错会是 APIG.0301，不会落到这里。
+    """
+    message = str(error)
+    return "invalid channel" in message or "group not found" in message
+
+
 def _refresh_benefit_models() -> list:
     """从 opengw 免费额度网关动态获取免费模型列表（IDE 流量分析确认的接口）。
 
     返回模型详情列表；失败时返回空列表，由调用方回退到 BENEFIT_MODELS 兜底。
+
+    注意 opengw 这条**权益渠道**自 2026-10 起对部分账号已下线，claim 与 config
+    会稳定返回 `4000 invalid channel, group not found`。这不是错误、也不值得
+    每次同步都重试——渠道没开通，重试一万次结果一样。首次遇到就用
+    `_benefit_channel_down` 记住，后续同步直接跳过，把日志从 WARNING 降到只报一次。
     """
+    global _benefit_channel_down
+    if _benefit_channel_down:
+        return []
     # 先领取限时福利（幂等）：未领取时福利模型调用必报 InferHub.4004.200 benefit not found。
     # 领取失败只记日志，不阻断模型列表同步。
     if BENEFIT_AUTO_CLAIM:
         try:
             benefit.claim()
         except Exception as error:
+            if _is_channel_down(error):
+                _benefit_channel_down = True
+                logger.info("opengw 权益渠道未开通（%s），本次跳过免费模型同步；"
+                            "模型列表由 AgentCenter 提供", error)
+                return []
             logger.warning("限时福利自动领取失败（不影响模型列表同步）: %s", error)
     try:
         response = _signed_request("GET", OPENGW_CONFIG_URL, timeout=30)
@@ -478,6 +504,12 @@ def _refresh_benefit_models() -> list:
             )
         return discovered
     except (requests.RequestException, ValueError, TypeError, KeyError) as error:
+        if _is_channel_down(error):
+            # getGatewayConfig 与 claim 共用一条权益渠道，claim 那边没先暴露时
+            # 这里会是第一次看到，同样按「渠道未开通」处理。
+            _benefit_channel_down = True
+            logger.info("opengw 权益渠道未开通，免费模型列表回退到内置清单")
+            return []
         logger.warning("免费模型列表同步失败，将使用兜底列表: %s", error)
         return []
 
