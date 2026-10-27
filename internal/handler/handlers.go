@@ -602,32 +602,19 @@ func (s *Server) benefitInfo() map[string]any {
 	return info
 }
 
+// adminCheckin 手动签到。走与后台循环同一套双通道编排（CheckinOnce）：
+// 两条通道互不依赖，Token 通道下线（2026-10 起本账号稳定回 4000
+// invalid channel）不能连累积分通道——那恰恰是唯一还有收益的一条。
+// 只有两条通道都没取得结论时才报失败，让用户能重试。
 func (s *Server) adminCheckin(w http.ResponseWriter, r *http.Request) {
-	if _, err := s.Ben.Claim(); err != nil {
+	text, done := s.Ben.CheckinOnce()
+	if !done {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{
-			"ok": false, "message": fmt.Sprintf("签到失败: %v", err)})
+			"ok": false, "message": "签到未取得结论" + text})
 		return
-	}
-	// Python：balance 在 claim 的同一层 try 里，失败同样走「签到失败」500
-	bal, err := s.Ben.Balance()
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{
-			"ok": false, "message": fmt.Sprintf("签到失败: %v", err)})
-		return
-	}
-	messages := []string{fmt.Sprintf("Token %s/%s",
-		comma(numOr(bal["total_balance"])), comma(numOr(bal["total_quota"])))}
-	if status, err := s.Ben.DoCreditClaim(); err == nil {
-		s.Ben.InvalidateCreditCaches()
-		if credits := s.Ben.CreditBalanceCached(); len(credits) > 0 {
-			messages = append(messages, fmt.Sprintf("积分 %s/%s（%s）",
-				comma(numOr(credits["remain"])), comma(numOr(credits["total"])), status))
-		}
-	} else {
-		s.Log.Warn("积分领取失败（不影响 Token 签到）: " + err.Error())
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok": true, "message": "签到成功：" + strings.Join(messages, "，")})
+		"ok": true, "message": "签到成功：" + strings.TrimSpace(text)})
 }
 
 func (s *Server) adminReloadModels(w http.ResponseWriter, r *http.Request) {
