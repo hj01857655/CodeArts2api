@@ -1,0 +1,22 @@
+services:
+  codearts2api:
+    build: .
+    container_name: codearts2api
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    environment:
+      - API_KEY=${API_KEY}
+      - CODEARTS_PROXY_HOST=${CODEARTS_PROXY_HOST:-0.0.0.0}
+      - CODEARTS_PROXY_PORT=${CODEARTS_PROXY_PORT:-8787}
+      - CODEARTS_STATE_DIR=${CODEARTS_STATE_DIR:-/app/data}
+      - DUMP=${DUMP}
+      - DUMP_DIR=${DUMP_DIR:-/app/data/dump}
+    volumes:
+      - ./data:/app/data
+    networks:
+      - codearts2api_net
+
+networks:
+  codearts2api_net:
+    driver: bridge

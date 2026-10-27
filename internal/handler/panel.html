@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CodeArts2api</title>
+<style>
+:root{--bg:#0f1115;--card:#181b22;--line:#262b36;--tx:#e6e9ef;--dim:#8b93a3;--ok:#4ade80;--bad:#f87171;--warn:#fbbf24;--acc:#6ea8fe}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.6 "Segoe UI",system-ui,sans-serif}
+.wrap{max-width:980px;margin:0 auto;padding:20px 16px 60px}
+h1{font-size:18px;margin:0 0 4px}
+.tabs{display:flex;gap:4px;border-bottom:1px solid var(--line);margin-bottom:16px;flex-wrap:wrap}
+.tabs button{background:none;border:none;color:var(--dim);padding:8px 14px;cursor:pointer;font-size:14px;border-bottom:2px solid transparent}
+.tabs button.on{color:var(--acc);border-bottom-color:var(--acc)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:14px}
+.card h3{margin:0 0 10px;font-size:14px}
+.kv{display:grid;grid-template-columns:110px 1fr;gap:4px 12px;font-size:13px}
+.kv b{color:var(--dim);font-weight:400}
+button{background:var(--acc);border:none;border-radius:6px;color:#0b1220;padding:7px 14px;cursor:pointer;font-size:13px;font-weight:600}
+button.ghost{background:none;border:1px solid var(--line);color:var(--tx);font-weight:400}
+button:disabled{opacity:.45;cursor:default}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line)}
+th{color:var(--dim);font-weight:400}
+.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}.dim{color:var(--dim)}
+.badge{display:inline-block;border-radius:99px;padding:1px 9px;font-size:11px;font-weight:600}
+.badge.on{background:#14321f;color:var(--ok)}.badge.off{background:#321414;color:var(--bad)}
+.mono{font-family:Consolas,monospace;font-size:12px;word-break:break-all}
+#msg{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#1f2430;border:1px solid var(--line);border-radius:8px;padding:10px 18px;font-size:13px;display:none;max-width:80vw}
+input{background:#0d0f13;border:1px solid var(--line);border-radius:6px;color:var(--tx);padding:7px 10px;font-size:13px;width:220px}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>CodeArts2api 控制台</h1>
+<div class="tabs">
+<button class="on" onclick="tab(this,'vMain')">概览</button>
+<button onclick="tab(this,'vBen')">签到 / 福利</button>
+<button onclick="tab(this,'vModels')">模型</button>
+<button onclick="tab(this,'vDiag')">诊断</button>
+</div>
+<div id="vMain"></div>
+<div id="vBen" style="display:none"></div>
+<div id="vModels" style="display:none"></div>
+<div id="vDiag" style="display:none"></div>
+</div>
+<div id="msg"></div>
+<script>
+"use strict";
+const $=s=>document.querySelector(s);
+function authHeaders(){const k=window.__API_KEY__||localStorage.ca_apikey;if(!k)return{"Content-Type":"application/json"};return{"Content-Type":"application/json","Authorization":"Bearer "+k}}
+const api=(p,opt={})=>fetch("/admin/api/"+p,Object.assign({headers:authHeaders()},opt)).then(r=>r.json()).catch(e=>({ok:false,message:String(e)}));
+const POST=(p,b)=>api(p,{method:"POST",body:JSON.stringify(b||{})});
+let tt;function toast(t,bad){const m=$("#msg");m.textContent=t;m.style.display="block";m.style.color=bad?"var(--bad)":"var(--tx)";clearTimeout(tt);tt=setTimeout(()=>m.style.display="none",3500)}
+function esc(s){const d=document.createElement("div");d.textContent=s==null?"":String(s);return d.innerHTML}
+function fmt(n){return n==null||n===""?"—":Number(n).toLocaleString("zh-CN")}
+function ts(ms){return ms?new Date(ms).toLocaleString("zh-CN"):"—"}
+function tab(btn,id){document.querySelectorAll(".tabs button").forEach(b=>b.classList.remove("on"));btn.classList.add("on");
+  ["vMain","vBen","vModels","vDiag"].forEach(v=>document.getElementById(v).style.display=v===id?"":"none")}
+
+async function load(){
+  const o=await api("overview");
+  if(!o.credential){$("#vMain").innerHTML='<div class="card bad">overview 加载失败：'+esc(o.message||"")+'</div>';return}
+  const c=o.credential,ben=o.benefit||{},ses=o.session||{},sch=o.schedule||{};
+  $("#vMain").innerHTML=`
+  <div class="card"><h3>凭据</h3><div class="kv">
+    <b>状态</b><span class="${c.valid?"ok":"bad"}">${c.valid?"有效":"无效"}${c.notice&&c.notice!=="正常"?" — "+esc(c.notice):""}</span>
+    <b>来源</b><span>${esc(c.source||"—")}</span>
+    <b>AK</b><span class="mono">${esc(c.ak||"—")}</span>
+    <b>过期时间</b><span>${esc(c.expires_at||"—")} <span class="dim">${esc(c.remain_text||"")}</span></span>
+    <b>自动签到</b><span>${sch.auto_checkin?'<span class="badge on">开启</span>':'<span class="badge off">关闭</span>'}</span>
+  </div></div>
+  <div class="card"><h3>服务</h3><div class="kv">
+    <b>服务名</b><span>${esc(o.service||"—")}</span>
+    <b>会话闸门</b><span>${ses.enabled?`<span class="badge on">开启</span> 上限 ${fmt(ses.limit)}`:'<span class="badge off">关闭</span>'}</span>
+    <b>Token 余额</b><span>${fmt(ben.total_balance)} / ${fmt(ben.total_quota)}</span>
+  </div></div>`;
+  const acts=ben.credit_activities||[];
+  $("#vBen").innerHTML=`
+  <div class="card"><h3>签到</h3>
+    <button onclick="doCheckin(this)">立即签到</button>
+    <span class="dim" style="margin-left:10px">上次签到：${ts(ben.last_checkin)}</span>
+    <div id="ckOut" style="margin-top:10px"></div></div>
+  <div class="card"><h3>Token 免费额度</h3><div class="kv">
+    <b>余额</b><span>${fmt(ben.total_balance)}</span>
+    <b>累计</b><span>${fmt(ben.total_quota)}</span></div></div>
+  <div class="card"><h3>积分</h3><div class="kv">
+    <b>总额</b><span>${fmt(ben.credit_total)}</span>
+    <b>已用</b><span>${fmt(ben.credit_used)}</span>
+    <b>剩余</b><span>${fmt(ben.credit_remain)}</span></div></div>
+  <div class="card"><h3>积分活动</h3>${acts.length?`<table><tr><th>活动</th><th>类型</th><th>额度</th><th>状态</th></tr>
+    ${acts.map(a=>`<tr><td>${esc(a.title||"—")}</td><td class="dim">${esc(a.type||"—")}</td>
+    <td>${fmt(a.amount)}</td><td class="${a.state==="待领取"?"warn":"dim"}">${esc(a.state||"—")}</td></tr>`).join("")}</table>`
+    :'<span class="dim">无</span>'}</div>
+  <div class="card"><h3>邀请</h3>${ben.invite&&ben.invite.inviteUrl
+    ?`<a href="${esc(ben.invite.inviteUrl)}" target="_blank" rel="noopener" style="color:var(--acc);word-break:break-all">${esc(ben.invite.inviteUrl)}</a>
+      <div class="dim" style="font-size:12px">已邀请 ${fmt(ben.invite.activationCount)} / ${fmt(ben.invite.maxActivations)}</div>`
+    :`<span class="dim">${esc(ben.invite&&ben.invite.error||"—")}</span>`}</div>`;
+  const models=o.models||[];
+  $("#vModels").innerHTML=`
+  <div class="card"><h3>模型同步</h3>
+    <button onclick="doReload(this)">重新同步模型</button>
+    <span class="dim" style="margin-left:10px">共 ${models.length} 个</span>
+    <div id="rlOut" style="margin-top:10px"></div></div>
+  <div class="card"><h3>模型列表</h3><table><tr><th>模型</th><th>通道</th></tr>
+    ${models.map(m=>`<tr><td>${esc(m.name||m.id)}<div class="dim mono" style="font-size:11px">${esc(m.id)}</div></td>
+    <td class="dim">${esc(m.channel||"—")}</td></tr>`).join("")}</table></div>`;
+  const inUse=ses.in_use||{},inUseKeys=Object.keys(inUse).filter(k=>inUse[k]>0);
+  $("#vDiag").innerHTML=`
+  <div class="card"><h3>会话闸门</h3><div class="kv">
+    <b>状态</b><span>${ses.enabled?'<span class="badge on">开启</span>':'<span class="badge off">关闭</span>'}</span>
+    <b>并发上限</b><span>${fmt(ses.limit)}</span>
+    <b>心跳</b><span>${ses.heartbeat?"开启":"关闭"} <span class="dim">间隔 ${fmt(ses.interval)}s</span></span>
+    <b>占用中</b><span>${inUseKeys.length?inUseKeys.map(k=>`${esc(k)} × ${inUse[k]}`).join("，"):"无"}</span></div></div>
+  <div class="card"><h3>本地鉴权</h3><div class="kv">
+    <b>API_KEY</b><span>${window.__API_KEY__?'<span class="badge on">已开启（key 已注入页面）</span>':'<span class="badge off">未开启（仅回环）</span>'}</span>
+  </div>
+  ${!window.__API_KEY__?`<div style="margin-top:10px"><input id="k" placeholder="API Key" value="${esc(localStorage.ca_apikey||"")}"> <button class="ghost" onclick="localStorage.ca_apikey=document.getElementById('k').value;toast('已保存')">保存</button></div>`:""}</div>
+  <div class="card"><h3>端点</h3><div class="mono dim" style="line-height:2">
+    GET /v1/models<br>POST /v1/chat/completions<br>POST /v1/messages<br>POST /v1/responses<br>POST /v1/ops/*（claim / confirm / delivery / invite）</div></div>`;
+}
+async function doCheckin(btn){btn.disabled=true;const r=await POST("checkin");
+  $("#ckOut").innerHTML=`<span class="${r.ok?"ok":"bad"}">${esc(r.message||"")}</span>`;btn.disabled=false;load()}
+async function doReload(btn){btn.disabled=true;const r=await POST("reload-models");
+  $("#rlOut").innerHTML=`<span class="${r.ok?"ok":"warn"}">${esc(r.message||"")}</span>`;btn.disabled=false;load()}
+load();
+</script>
+</body>
+</html>
